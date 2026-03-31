@@ -69,3 +69,77 @@ To make the MCP server available across all workspaces, copy `mcp_guid_server.py
     }
 }
 ```
+
+---
+
+### EmailMcpServer
+
+An [MCP](https://modelcontextprotocol.io/) server that gives AI agents read, search, and drafting access to Microsoft Outlook email via the MAPI COM interface. Built with the [FastMCP](https://github.com/modelcontextprotocol/python-sdk) Python SDK and `pywin32`. Requires Outlook to be installed locally.
+
+> **Windows only.** Depends on the Win32 COM automation layer provided by Outlook.
+
+#### Features
+
+**Reading & browsing**
+- **list_email_accounts** - List all accounts in the local Outlook MAPI profile
+- **list_folders** - List folders (optionally recursive) for an account with item counts
+- **get_folder_counts** - Get total and unread item counts for a folder (lightweight, no email iteration)
+- **list_emails** - List emails in a folder, newest first; supports `since`/`until` date range and `unread_only` filter
+- **search_emails** - Search emails by subject, sender, and/or body text within a folder
+- **get_email** - Retrieve the full content of an email by entry ID (body returned as Markdown)
+- **get_thread** - Retrieve all messages in a conversation thread, sorted oldest-first
+
+**Attachments**
+- **list_attachments** - List all attachments on an email
+- **read_attachment_text** - Read the text content of a plain-text attachment directly (no permanent file saved); supports .txt, .csv, .py, .md, .json, .yaml, .xml, .html, .sh, .ps1, and more
+- **download_attachment** - Download a specific attachment to a local directory
+
+**Drafting** *(all tools save a draft and open it in Outlook for review — nothing is sent automatically)*
+- **create_draft** - Compose a new email draft
+- **create_reply** - Create a reply to an existing email (Reply or Reply All)
+- **create_forward** - Create a forward draft for an existing email
+
+#### Setup
+
+```bash
+cd email_mcp_server
+pip install -r requirements.txt
+```
+
+#### Usage
+
+Run as a stdio MCP server:
+
+```bash
+python mcp_email_server.py
+```
+
+##### VS Code (workspace level)
+
+Add the following to your workspace `settings.json`:
+
+```json
+"mcp": {
+    "servers": {
+        "email": {
+            "command": "python",
+            "args": ["${workspaceFolder}/email_mcp_server/mcp_email_server.py"]
+        }
+    }
+}
+```
+
+##### VS Code (system level)
+
+To make the MCP server available across all workspaces, copy `mcp_email_server.py` to a permanent location (e.g. `C:\Users\<user name>\AppData\Roaming\Code\User\mcp\email\`) and add the following to your global `mcp.json`, located at `C:\Users\<user name>\AppData\Roaming\Code\User\mcp.json`:
+
+```json
+{
+    "servers": {
+        "email": {
+            "command": "python3",
+            "args": ["C:\\Users\\<user name>\\AppData\\Roaming\\Code\\User\\mcp\\email\\mcp_email_server.py"]
+        }
+    }
+}
+```
