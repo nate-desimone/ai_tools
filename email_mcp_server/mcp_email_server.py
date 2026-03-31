@@ -273,15 +273,22 @@ def search_emails(
 ) -> str:
     """Search emails by subject, sender, and/or body text within a folder.
 
+    IMPORTANT: At least one of 'subject', 'sender', or 'body' MUST be
+    provided. Calling this tool with only 'account_name' (and no search
+    criteria) will raise an error. Use list_emails instead if you want to
+    browse emails without a search filter.
+
     Args:
         account_name: Display name of the Outlook account.
         folder_path: Slash-separated path from the account root. Default: "Inbox".
-        subject: Optional substring to match against the email subject
-            (case-insensitive).
-        sender: Optional substring to match against the sender name or email
-            address (case-insensitive).
-        body: Optional substring to search for within the email body
-            (case-insensitive). Searches the plain-text version of the body.
+        subject: Substring to match against the email subject (case-insensitive).
+            Example: subject="project update" finds all emails whose subject
+            contains "project update".
+        sender: Substring to match against the sender name or email address
+            (case-insensitive). Example: sender="alice" matches emails from
+            any sender whose name or address contains "alice".
+        body: Substring to search for within the email body (case-insensitive).
+            Searches the plain-text version of the body.
         max_count: Maximum number of results to return (1-100). Default: 20.
 
     Returns a JSON array of matching email summary objects. Returns an empty
