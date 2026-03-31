@@ -18,12 +18,14 @@ Usage:
 """
 
 import json
+import re
 import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import html2text
+import markdown as _markdown
 import pythoncom
 import win32com.client
 
@@ -117,6 +119,38 @@ def _mail_item_summary(item) -> dict:
         "is_unread": bool(item.UnRead),
         "conversation_id": conversation_id,
     }
+
+
+_MD_EXTENSIONS = ["fenced_code", "tables"]
+_BODY_FONT = "font-family:Aptos,Calibri,sans-serif;font-size:11pt;"
+_MONO_FONT = "font-family:Consolas,'Courier New',monospace;font-size:11pt;"
+_PRE_STYLE = _MONO_FONT + "background-color:#f5f5f5;padding:8px;"
+
+
+def _md_to_fragment(md_text: str) -> str:
+    """Convert Markdown to a styled HTML fragment (no html/head/body wrappers)."""
+    html = _markdown.markdown(md_text, extensions=_MD_EXTENSIONS)
+    html = re.sub(r"<code(?=[>\s])", f'<code style="{_MONO_FONT}"', html)
+    html = re.sub(r"<pre(?=[>\s])", f'<pre style="{_PRE_STYLE}"', html)
+    return f'<div style="{_BODY_FONT}">{html}</div>'
+
+
+def _markdown_to_html(md_text: str) -> str:
+    """Convert Markdown to a complete HTML document."""
+    return (
+        '<html><head><meta charset="utf-8"></head><body>'
+        + _md_to_fragment(md_text)
+        + "</body></html>"
+    )
+
+
+def _prepend_html(fragment: str, existing_html: str) -> str:
+    """Insert *fragment* right after the opening <body> tag of *existing_html*."""
+    match = re.search(r"<body[^>]*>", existing_html, re.IGNORECASE)
+    if match:
+        pos = match.end()
+        return existing_html[:pos] + fragment + existing_html[pos:]
+    return fragment + existing_html
 
 
 # ---------------------------------------------------------------------------
@@ -677,7 +711,8 @@ def create_draft(
     Args:
         to: List of recipient email addresses or display names.
         subject: Subject line of the email.
-        body: Plain-text body of the email.
+        body: Markdown-formatted body of the email. Standard text is rendered in
+            Aptos 11pt; code spans and fenced code blocks use Consolas 11pt.
         cc: Optional list of CC recipient addresses or display names.
         bcc: Optional list of BCC recipient addresses or display names.
 
@@ -691,7 +726,7 @@ def create_draft(
     mail = outlook.CreateItem(0)  # 0 = olMailItem
 
     mail.Subject = subject
-    mail.Body = body
+    mail.HTMLBody = _markdown_to_html(body)
 
     for address in to:
         r = mail.Recipients.Add(address)
@@ -737,7 +772,9 @@ def create_reply(
     Args:
         entry_id: The EntryID of the email to reply to, as returned by
             list_emails, search_emails, or get_email.
-        body: The plain-text reply body to insert above the quoted original.
+        body: Markdown-formatted body to insert above the quoted original.
+            Standard text is rendered in Aptos 11pt; code spans and fenced
+            code blocks use Consolas 11pt.
         reply_all: When True, replies to all recipients (Reply All).
             When False (default), replies only to the sender.
 
@@ -752,7 +789,7 @@ def create_reply(
     else:
         reply = original.Reply()
 
-    reply.Body = body + "\r\n\r\n" + reply.Body
+    reply.HTMLBody = _prepend_html(_md_to_fragment(body), reply.HTMLBody)
 
     reply.Save()
 
@@ -787,7 +824,9 @@ def create_forward(
         entry_id: The EntryID of the email to forward, as returned by
             list_emails, search_emails, or get_email.
         to: List of recipient email addresses or display names.
-        body: Plain-text message to insert above the forwarded original.
+        body: Markdown-formatted message to insert above the forwarded original.
+            Standard text is rendered in Aptos 11pt; code spans and fenced
+            code blocks use Consolas 11pt.
         cc: Optional list of CC recipient addresses or display names.
         bcc: Optional list of BCC recipient addresses or display names.
 
@@ -801,7 +840,7 @@ def create_forward(
     original = namespace.GetItemFromID(entry_id)
     fwd = original.Forward()
 
-    fwd.Body = body + "\r\n\r\n" + fwd.Body
+    fwd.HTMLBody = _prepend_html(_md_to_fragment(body), fwd.HTMLBody)
 
     for address in to:
         r = fwd.Recipients.Add(address)
