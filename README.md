@@ -143,3 +143,72 @@ To make the MCP server available across all workspaces, copy `mcp_email_server.p
     }
 }
 ```
+
+---
+
+### OneNoteMcpServer
+
+An [MCP](https://modelcontextprotocol.io/) server that gives AI agents read, search, and write access to Microsoft OneNote notebooks via the OneNote COM automation interface. Built with the [FastMCP](https://github.com/modelcontextprotocol/python-sdk) Python SDK and `comtypes`. Requires OneNote 2016 or 2019 (classic desktop) to be installed locally.
+
+> **Windows only.** Depends on the OneNote 2016/2019 COM type library (`IApplication` vtable interface).
+
+#### Features
+
+**Browsing**
+- **list_notebooks** - List all OneNote notebooks currently open in the local OneNote application
+- **list_sections** - List all sections and section groups in a notebook (recursive, depth-first)
+- **list_pages** - List all pages in a section
+
+**Reading**
+- **get_page_content** - Retrieve the full content of a page as clean Markdown, suitable for direct consumption by AI agents. Handles headings, nested bullet and numbered lists (up to any depth), tables, code blocks, blockquotes, bold/italic inline formatting, and hyperlinks.
+- **search_notes** - Full-text search across all notebooks (or a specific notebook) using the OneNote search index
+
+**Writing**
+- **create_section** - Create a new section inside a notebook or section group
+- **create_page** - Create a new page in a section with a title and Markdown body content
+- **update_page** - Update an existing page by appending new Markdown content or replacing all existing content
+
+#### Setup
+
+```bash
+cd onenote_mcp_server
+pip install -r requirements.txt
+```
+
+#### Usage
+
+Run as a stdio MCP server:
+
+```bash
+python mcp_onenote_server.py
+```
+
+##### VS Code (workspace level)
+
+Add the following to your workspace `settings.json`:
+
+```json
+"mcp": {
+    "servers": {
+        "onenote": {
+            "command": "python",
+            "args": ["${workspaceFolder}/onenote_mcp_server/mcp_onenote_server.py"]
+        }
+    }
+}
+```
+
+##### VS Code (system level)
+
+To make the MCP server available across all workspaces, copy `mcp_onenote_server.py` to a permanent location (e.g. `C:\Users\<user name>\AppData\Roaming\Code\User\mcp\onenote\`) and add the following to your global `mcp.json`, located at `C:\Users\<user name>\AppData\Roaming\Code\User\mcp.json`:
+
+```json
+{
+    "servers": {
+        "onenote": {
+            "command": "python3",
+            "args": ["C:\\Users\\<user name>\\AppData\\Roaming\\Code\\User\\mcp\\onenote\\mcp_onenote_server.py"]
+        }
+    }
+}
+```
