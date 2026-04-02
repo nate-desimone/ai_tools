@@ -228,29 +228,33 @@ def list_folders(account_name: str, recursive: bool = False) -> str:
 def list_emails(
     account_name: str,
     folder_path: str = "Inbox",
-    max_count: int = 20,
+    max_results: int = 20,
     since: Optional[str] = None,
     until: Optional[str] = None,
     unread_only: bool = False,
 ) -> str:
     """List emails in a folder, sorted newest first.
 
+    Use this tool to browse or page through emails without a text search
+    filter. To search by subject, sender, or body text, use search_emails
+    instead (which also supports date filtering).
+
     Args:
         account_name: Display name of the Outlook account.
         folder_path: Slash-separated path from the account root
             (e.g. "Inbox" or "Inbox/Projects"). Default: "Inbox".
-        max_count: Maximum number of emails to return (1-100). Default: 20.
+        max_results: Maximum number of emails to return (1-100). Default: 20.
         since: Optional ISO-8601 date string (e.g. "2026-01-01"). Only emails
-            on or after this date are returned.
+            received on or after this date are returned.
         until: Optional ISO-8601 date string (e.g. "2026-12-31"). Only emails
-            on or before this date are returned.
+            received on or before this date are returned.
         unread_only: When True, only unread emails are returned. Default: False.
 
     Returns a JSON array of email summary objects, each containing:
         entry_id, subject, sender_name, sender_email, received_time,
         has_attachments, is_unread, conversation_id.
     """
-    max_count = max(1, min(max_count, 100))
+    max_count = max(1, min(max_results, 100))
     _, namespace = _get_outlook()
     folder = _resolve_folder(namespace, account_name, folder_path)
 
@@ -303,51 +307,78 @@ def search_emails(
     subject: Optional[str] = None,
     sender: Optional[str] = None,
     body: Optional[str] = None,
-    max_count: int = 20,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    max_results: int = 20,
 ) -> str:
-    """Search emails by subject, sender, and/or body text within a folder.
+    """Search emails by subject, sender, body text, and/or date range within a folder.
 
-    IMPORTANT: At least one of 'subject', 'sender', or 'body' MUST be
-    provided. Calling this tool with only 'account_name' (and no search
-    criteria) will raise an error. Use list_emails instead if you want to
-    browse emails without a search filter.
+    IMPORTANT: At least one of 'subject', 'sender', 'body', 'since', or
+    'until' MUST be provided. All provided filters are combined with AND
+    logic. Use list_emails instead if you only want to browse a folder
+    without any filter.
+
+    There is NO generic 'query' parameter. Every filter is a separate,
+    named argument:
+        - subject  — text to find in the subject line
+        - sender   — text to match against the sender name or email address
+        - body     — text to find anywhere in the message body
+        - since    — earliest received date (ISO-8601, e.g. "2026-03-29")
+        - until    — latest received date  (ISO-8601, e.g. "2026-04-02")
 
     Args:
-        account_name: Display name of the Outlook account.
-        folder_path: Slash-separated path from the account root. Default: "Inbox".
-        subject: Substring to match against the email subject (case-insensitive).
-            Example: subject="project update" finds all emails whose subject
-            contains "project update".
+        account_name: Display name of the Outlook account (e.g.
+            "tom@example.com"). Required.
+        folder_path: Slash-separated path from the account root.
+            Default: "Inbox".
+        subject: Substring to match against the email subject
+            (case-insensitive). Example: subject="project update".
         sender: Substring to match against the sender name or email address
-            (case-insensitive). Example: sender="alice" matches emails from
-            any sender whose name or address contains "alice".
-        body: Substring to search for within the email body (case-insensitive).
-            Searches the plain-text version of the body.
-        max_count: Maximum number of results to return (1-100). Default: 20.
+            (case-insensitive). Example: sender="alice@example.com".
+        body: Substring to search for within the email body
+            (case-insensitive).
+        since: ISO-8601 date string. Only emails received on or after this
+            date are returned. Example: since="2026-03-29".
+        until: ISO-8601 date string. Only emails received on or before this
+            date are returned. Example: until="2026-04-02".
+        max_results: Maximum number of results to return (1-100). Default: 20.
 
-    Returns a JSON array of matching email summary objects. Returns an empty
-    array if no emails match.
+    Returns a JSON array of matching email summary objects, each containing:
+        entry_id, subject, sender_name, sender_email, received_time,
+        has_attachments, is_unread, conversation_id.
+    Returns an empty array if no emails match.
     """
-    if subject is None and sender is None and body is None:
-        raise ValueError("At least one of 'subject', 'sender', or 'body' must be provided.")
+    if subject is None and sender is None and body is None and since is None and until is None:
+        raise ValueError(
+            "At least one of 'subject', 'sender', 'body', 'since', or 'until' must be provided."
+        )
 
-    max_count = max(1, min(max_count, 100))
+    max_count = max(1, min(max_results, 100))
     _, namespace = _get_outlook()
     folder = _resolve_folder(namespace, account_name, folder_path)
 
     items = folder.Items
     items.Sort("[ReceivedTime]", True)
 
-    # Attempt a COM-level Restrict for subject-only queries to reduce iteration cost.
-    # Single quotes in the subject are escaped to prevent the Restrict call from
-    # breaking on email subjects that contain apostrophes.
+    # Build a COM-level Restrict filter to reduce iteration cost.
+    # Single quotes in user-supplied strings are escaped to prevent
+    # the Restrict call from breaking on values that contain apostrophes.
     restrict_applied = False
+    filters = []
+    if since:
+        dt = datetime.fromisoformat(since)
+        filters.append(f"[ReceivedTime] >= '{dt.strftime('%m/%d/%Y')}'")
+    if until:
+        dt = datetime.fromisoformat(until)
+        filters.append(f"[ReceivedTime] <= '{dt.strftime('%m/%d/%Y')}'")
     if subject and not sender and not body:
         escaped_subject = subject.replace("'", "''")
+        filters.append(
+            f"@SQL=\"urn:schemas:httpmail:subject\" LIKE '%{escaped_subject}%'"
+        )
+    if filters:
         try:
-            items = items.Restrict(
-                f"@SQL=\"urn:schemas:httpmail:subject\" LIKE '%{escaped_subject}%'"
-            )
+            items = items.Restrict(" AND ".join(filters))
             restrict_applied = True
         except Exception:
             pass
@@ -366,6 +397,18 @@ def search_emails(
             if not restrict_applied and subject_lower:
                 if subject_lower not in (item.Subject or "").lower():
                     continue
+            if not restrict_applied and since:
+                try:
+                    if item.ReceivedTime.isoformat()[:10] < since[:10]:
+                        continue
+                except Exception:
+                    pass
+            if not restrict_applied and until:
+                try:
+                    if item.ReceivedTime.isoformat()[:10] > until[:10]:
+                        continue
+                except Exception:
+                    pass
             if sender_lower:
                 name_match = sender_lower in (item.SenderName or "").lower()
                 email_match = sender_lower in (item.SenderEmailAddress or "").lower()
