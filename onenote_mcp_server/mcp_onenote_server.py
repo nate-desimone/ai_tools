@@ -1097,9 +1097,6 @@ def search_notes(
 def create_section(parent_id: str, section_name: str) -> str:
     """Create a new section in a OneNote notebook or section group.
 
-    Uses the OneNote COM OpenHierarchy API with CreateFileType=cftSection,
-    which creates a new .one file in the parent's folder.
-
     Args:
         parent_id: The ID of the target notebook or section group, obtained
             from list_notebooks or list_sections.
@@ -1134,7 +1131,7 @@ def create_page(
     """Create a new page in a OneNote section.
 
     First creates a blank titled page via the COM API, then populates it
-    with the supplied title and Markdown content using UpdatePageContent.
+    with the supplied title and Markdown content.
 
     Args:
         section_id: The ID of the section, obtained from list_sections.
