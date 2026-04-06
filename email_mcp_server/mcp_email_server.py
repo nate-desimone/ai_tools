@@ -154,6 +154,76 @@ def _prepend_html(fragment: str, existing_html: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Query-string parser
+# ---------------------------------------------------------------------------
+
+# Tokens recognized in the 'query' parameter of search_emails.
+# Supported operators (case-insensitive):
+#   from:<value>        → sender
+#   subject:<value>     → subject
+#   body:<value>        → body
+#   after:<YYYY-MM-DD>  → since  (also accepts YYYY/MM/DD)
+#   before:<YYYY-MM-DD> → until  (also accepts YYYY/MM/DD)
+#   newer_than:<value>  → alias for after:
+#   older_than:<value>  → alias for before:
+# Remaining unrecognised tokens are joined and used as a body substring filter.
+_QUERY_TOKEN_RE = re.compile(
+    r'(from|subject|body|after|before|newer_than|older_than):("[^"]*"|\S+)',
+    re.IGNORECASE,
+)
+
+
+def _parse_query(
+    query: str,
+    subject: Optional[str],
+    sender: Optional[str],
+    body: Optional[str],
+    since: Optional[str],
+    until: Optional[str],
+) -> tuple:
+    """Parse a Gmail-style query string and merge with any explicit keyword args.
+
+    Explicit keyword arguments always take precedence over values extracted
+    from the query string.  Returns (subject, sender, body, since, until).
+    """
+    remaining = query
+    q_subject = q_sender = q_body = q_since = q_until = None
+
+    for m in _QUERY_TOKEN_RE.finditer(query):
+        op = m.group(1).lower()
+        val = m.group(2).strip('"')
+        # Normalise date separators so both YYYY/MM/DD and YYYY-MM-DD work.
+        val_norm = val.replace("/", "-")
+        if op == "from":
+            q_sender = val
+        elif op == "subject":
+            q_subject = val
+        elif op == "body":
+            q_body = val
+        elif op in ("after", "newer_than"):
+            q_since = val_norm
+        elif op in ("before", "older_than"):
+            q_until = val_norm
+        # Remove the matched token from 'remaining' so leftover text can be
+        # used as a plain-text body filter.
+        remaining = remaining.replace(m.group(0), "", 1)
+
+    # Any leftover words become a body substring filter.
+    leftover = remaining.strip()
+    if leftover and q_body is None:
+        q_body = leftover
+
+    # Explicit keyword args win over query-parsed values.
+    return (
+        subject if subject is not None else q_subject,
+        sender  if sender  is not None else q_sender,
+        body    if body    is not None else q_body,
+        since   if since   is not None else q_since,
+        until   if until   is not None else q_until,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
@@ -304,6 +374,7 @@ def list_emails(
 def search_emails(
     account_name: str,
     folder_path: str = "Inbox",
+    query: Optional[str] = None,
     subject: Optional[str] = None,
     sender: Optional[str] = None,
     body: Optional[str] = None,
@@ -313,24 +384,32 @@ def search_emails(
 ) -> str:
     """Search emails by subject, sender, body text, and/or date range within a folder.
 
-    IMPORTANT: At least one of 'subject', 'sender', 'body', 'since', or
-    'until' MUST be provided. All provided filters are combined with AND
-    logic. Use list_emails instead if you only want to browse a folder
-    without any filter.
+    You may supply filters using either the 'query' convenience parameter
+    (Gmail-style syntax) or the individual named parameters — or both.
+    When both are given, the named parameter always overrides the
+    corresponding query token.  At least one filter must be provided.
 
-    There is NO generic 'query' parameter. Every filter is a separate,
-    named argument:
-        - subject  — text to find in the subject line
-        - sender   — text to match against the sender name or email address
-        - body     — text to find anywhere in the message body
-        - since    — earliest received date (ISO-8601, e.g. "2026-03-29")
-        - until    — latest received date  (ISO-8601, e.g. "2026-04-02")
+    'query' supports the following Gmail-style operators:
+        from:<sender>           — match sender name or email address
+        subject:<text>          — match subject line
+        body:<text>             — match email body
+        after:<YYYY-MM-DD>      — received on or after date (also YYYY/MM/DD)
+        before:<YYYY-MM-DD>     — received on or before date
+        newer_than:<YYYY-MM-DD> — alias for after:
+        older_than:<YYYY-MM-DD> — alias for before:
+        <plain text>            — unrecognized tokens become a body filter
+
+    Examples:
+        query="after:2026-03-28"
+        query="from:alice@example.com subject:budget after:2026-01-01"
+        query="project update"  (body substring search)
 
     Args:
         account_name: Display name of the Outlook account (e.g.
             "tom@example.com"). Required.
         folder_path: Slash-separated path from the account root.
             Default: "Inbox".
+        query: Optional Gmail-style query string (see above).
         subject: Substring to match against the email subject
             (case-insensitive). Example: subject="project update".
         sender: Substring to match against the sender name or email address
@@ -348,9 +427,15 @@ def search_emails(
         has_attachments, is_unread, conversation_id.
     Returns an empty array if no emails match.
     """
+    if query:
+        subject, sender, body, since, until = _parse_query(
+            query, subject, sender, body, since, until
+        )
+
     if subject is None and sender is None and body is None and since is None and until is None:
         raise ValueError(
-            "At least one of 'subject', 'sender', 'body', 'since', or 'until' must be provided."
+            "At least one filter must be provided via 'query' or the individual "
+            "parameters 'subject', 'sender', 'body', 'since', or 'until'."
         )
 
     max_count = max(1, min(max_results, 100))
