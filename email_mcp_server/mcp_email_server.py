@@ -24,7 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import html2text
+from markdownify import markdownify as _markdownify
 import markdown as _markdown
 import pythoncom
 import win32com.client
@@ -539,10 +539,7 @@ def get_email(entry_id: str) -> str:
 
     html_body = item.HTMLBody
     if html_body:
-        converter = html2text.HTML2Text()
-        converter.ignore_images = True   # image tags add noise, not value
-        converter.body_width = 0         # disable line wrapping
-        body = converter.handle(html_body).strip()
+        body = _markdownify(html_body, strip=["img"]).strip()
         body_format = "markdown"
     else:
         body = item.Body or ""
@@ -747,10 +744,7 @@ def get_thread(
     def _get_body(item):
         html_body = item.HTMLBody
         if html_body:
-            converter = html2text.HTML2Text()
-            converter.ignore_images = True
-            converter.body_width = 0
-            return converter.handle(html_body).strip(), "markdown"
+            return _markdownify(html_body, strip=["img"]).strip(), "markdown"
         return item.Body or "", "plain"
 
     results = []

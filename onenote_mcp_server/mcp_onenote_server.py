@@ -25,7 +25,7 @@ import time
 from xml.etree import ElementTree as ET
 
 import comtypes.client
-import html2text
+from markdownify import markdownify as _markdownify
 import markdown as _markdown
 
 from mcp.server.fastmcp import FastMCP
@@ -228,16 +228,7 @@ def _extract_search_results(root: ET.Element, max_results: int) -> list:
 # ---------------------------------------------------------------------------
 
 _MD_EXTENSIONS = ["fenced_code", "tables"]
-_H2T = html2text.HTML2Text()
-_H2T.ignore_images = True
-_H2T.body_width = 0
-_H2T.strong_mark = "**"
-_H2T.ul_item_mark = "-"
-# Use asterisks for italic so round-trip markdown uses *text* not _text_
-try:
-    _H2T.emphasis_mark = "*"
-except AttributeError:
-    pass  # older html2text versions don't expose this
+
 
 # ---------------------------------------------------------------------------
 # Read-path helpers: OneNote XML → Markdown
@@ -274,8 +265,8 @@ def _is_blockquote_oe(html: str) -> bool:
 def _inline_html_to_md(html_frag: str) -> str:
     """Convert inline HTML with CSS style spans to Markdown.
 
-    html2text does not understand `style='font-weight:bold'`.  We
-    pre-convert style spans to semantic HTML that html2text handles:
+    markdownify does not understand `style='font-weight:bold'`.  We
+    pre-convert style spans to semantic HTML that markdownify handles:
       font-weight:bold   → <strong>
       font-style:italic  → <em>
       font-family:Consolas → <code>
@@ -308,8 +299,7 @@ def _inline_html_to_md(html_frag: str) -> str:
     # Remaining spans — just unwrap
     frag = re.sub(r"<span[^>]*>(.*?)</span>", r"\1", frag, flags=re.DOTALL)
 
-    md = _H2T.handle(frag).strip()
-    # html2text leaves HTML entities unescaped in some edge cases
+    md = _markdownify(frag, strip=["img"], bullets="-").strip()
     md = _html_lib.unescape(md)
     return md
 
@@ -375,10 +365,17 @@ def _page_xml_to_markdown(xml_str: str) -> str:
 
     def _process_oec(oec_el, depth: int) -> None:
         indent = "  " * depth  # 2 spaces/level; _normalise_list_indent converts to 4 on write-back
+        # Own sequential counter for numbered list items.  We ignore OneNote's
+        # stored `text` attribute because OneNote rewrites it using its own
+        # numbering style (Roman, letters, etc.) for non-zero numberSequence
+        # values.  The counter resets whenever a non-numbered OE appears so
+        # that two separate numbered lists both start at 1.
+        num_counters: dict = {}
         for oe in oec_el.findall(_tag("OE")):
             # Table
             table_el = oe.find(_tag("Table"))
             if table_el is not None:
+                num_counters.clear()
                 _flush_list()
                 output_parts.append(_table_el_to_md(table_el))
                 child_oec = oe.find(_tag("OEChildren"))
@@ -387,9 +384,11 @@ def _page_xml_to_markdown(xml_str: str) -> str:
                 continue
             # Image / Ink
             if oe.find(_tag("Image")) is not None:
+                num_counters.clear()
                 _add_block(f"{indent}[Image]")
                 continue
             if oe.find(_tag("InkNode")) is not None:
+                num_counters.clear()
                 _add_block(f"{indent}[Ink]")
                 continue
             # Gather text CDATA
@@ -398,7 +397,17 @@ def _page_xml_to_markdown(xml_str: str) -> str:
             child_oec = oe.find(_tag("OEChildren"))
             # Code line: font-family:Consolas on the OE style
             if "font-family:Consolas" in oe_style:
-                _flush_list()  # don't mix list_accum with code
+                # Flush preceding non-code content when starting a new code
+                # block.  If code_lines is already populated we are mid-block;
+                # do NOT call _flush_list() — that would invoke _flush_code()
+                # and break the open block.  Only flush list_accum.
+                if list_accum:
+                    if code_lines:
+                        # Edge case: a list/blockquote OE arrived between two
+                        # code lines.  Close the open block first, then flush.
+                        _flush_code()
+                    output_parts.append("\n".join(list_accum))
+                    list_accum.clear()
                 inner = re.sub(r"<[^>]+>", "", combined)
                 inner = _html_lib.unescape(inner)
                 if inner in ("\u00a0", "\xa0"):
@@ -409,8 +418,15 @@ def _page_xml_to_markdown(xml_str: str) -> str:
                 continue
             # Non-code: flush any pending code block
             _flush_code()
+            # Horizontal rule sentinel — a run of U+2500 box-drawing chars
+            # written by _markdown_to_oes.  Detect >= 8 consecutive ─ chars.
+            if re.fullmatch(r"\u2500{8,}", combined.strip()):
+                num_counters.clear()
+                _add_block("---")
+                continue
             # Blockquote: color:#555555 on the OE style
             if "color:#555555" in oe_style:
+                num_counters.clear()
                 inner = re.sub(r"<[^>]+>", "", combined)
                 inner = _html_lib.unescape(inner).strip()
                 if inner:
@@ -434,21 +450,25 @@ def _page_xml_to_markdown(xml_str: str) -> str:
             if list_el is None and depth == 0:
                 text_clean = re.sub(r"^\*\*(.*)\*\*$", r"\1", text.strip())
                 if font_size >= 20:
+                    num_counters.clear()
                     _add_block(f"# {text_clean}")
                     if child_oec is not None:
                         _process_oec(child_oec, depth)
                     continue
                 if font_size >= 17:
+                    num_counters.clear()
                     _add_block(f"## {text_clean}")
                     if child_oec is not None:
                         _process_oec(child_oec, depth)
                     continue
                 if font_size >= 14:
+                    num_counters.clear()
                     _add_block(f"### {text_clean}")
                     if child_oec is not None:
                         _process_oec(child_oec, depth)
                     continue
                 if font_size >= 12:
+                    num_counters.clear()
                     _add_block(f"#### {text_clean}")
                     if child_oec is not None:
                         _process_oec(child_oec, depth)
@@ -456,18 +476,27 @@ def _page_xml_to_markdown(xml_str: str) -> str:
             # List items
             if list_el is not None:
                 if list_el.find(_tag("Bullet")) is not None:
+                    num_counters.clear()
                     list_accum.append(f"{indent}- {text}")
                     if child_oec is not None:
                         _process_oec(child_oec, depth + 1)
                     continue
                 num_el = list_el.find(_tag("Number"))
                 if num_el is not None:
-                    num = num_el.get("text", "").rstrip(".")
+                    # Always use our own counter — OneNote rewrites the `text`
+                    # attribute to match its internal sequence style, which
+                    # varies by numberSequence value (Roman, letters, etc.).
+                    # Our counter resets on any non-numbered OE so separate
+                    # numbered lists each start at 1.
+                    seq = num_el.get("numberSequence", "0")
+                    num_counters[seq] = num_counters.get(seq, 0) + 1
+                    num = str(num_counters[seq])
                     list_accum.append(f"{indent}{num}. {text}")
                     if child_oec is not None:
                         _process_oec(child_oec, depth + 1)
                     continue
             # Plain paragraph
+            num_counters.clear()
             _flush_list()
             output_parts.append(f"{indent}{text}")
             if child_oec is not None:
@@ -561,23 +590,44 @@ def _markdown_to_oes(md_text: str) -> list:
     """
     html = _markdown.markdown(md_text.strip(), extensions=_MD_EXTENSIONS)
 
-    # Normalise 2-space-indented list items to 4-space so that the markdown
+    # Normalize 2-space-indented list items to 4-space so that the markdown
     # library correctly nests them.  Agents often emit 2-space indentation;
     # Python's markdown library requires 4 spaces per indent level.
     # We only touch lines that start with spaces followed by a list marker.
+    def _is_list_line(stripped: str) -> bool:
+        return bool(stripped) and (
+            stripped[0] in ("-", "*", "+")
+            or (stripped[0].isdigit() and ". " in stripped[:5])
+        )
+
     def _normalise_list_indent(md: str) -> str:
         lines = md.split("\n")
+
+        # Detect the minimum non-zero indentation used in list items.
+        # If the minimum is already >= 4, the input uses 4-space (or larger)
+        # indentation units — Python-markdown can handle it as-is, so skip
+        # conversion entirely.  Only normalize when the minimum is 2 (the
+        # common agent output style), scaling every indent level by ×2.
+        min_indent = None
+        for line in lines:
+            stripped = line.lstrip(" ")
+            n = len(line) - len(stripped)
+            if n > 0 and _is_list_line(stripped):
+                if min_indent is None or n < min_indent:
+                    min_indent = n
+
+        if min_indent is None or min_indent >= 4:
+            # Already using 4-space units (or no indented list lines found).
+            return md
+
+        # min_indent == 2 (or 1/3, handled generically): scale to 4-space.
+        scale = max(1, 4 // min_indent)
         out = []
         for line in lines:
             stripped = line.lstrip(" ")
             n_spaces = len(line) - len(stripped)
-            if n_spaces > 0 and stripped and stripped[0] in ("-", "*", "+") or (
-                n_spaces > 0 and stripped and stripped[0].isdigit() and ". " in stripped[:5]
-            ):
-                # Convert each 2-space indent unit to 4 spaces
-                units = n_spaces // 2
-                remainder = n_spaces % 2
-                line = " " * (units * 4 + remainder) + stripped
+            if n_spaces > 0 and _is_list_line(stripped):
+                line = " " * (n_spaces * scale) + stripped
             out.append(line)
         return "\n".join(out)
 
@@ -658,9 +708,11 @@ def _markdown_to_oes(md_text: str) -> list:
             # Nested <ul>/<ol> inside <li> become <one:OEChildren> blocks.
             def _oes_from_list_el(list_el, is_bullet: bool) -> list:
                 result = []
+                counter = 0  # sequential number for ordered lists
                 for li_el in list_el:
                     if li_el.tag != "li":
                         continue
+                    counter += 1
                     # Collect inline text content, stop at any nested list.
                     text_parts = [li_el.text or ""]
                     nested_list_el = None
@@ -697,7 +749,7 @@ def _markdown_to_oes(md_text: str) -> list:
                             "<one:OE>"
                             "<one:List>"
                             "<one:Number numberSequence=\"0\" numberFormat=\"##.\""
-                            " fontSize=\"11.0\"/>"
+                            f" text=\"{counter}.\" fontSize=\"11.0\"/>"
                             "</one:List>"
                             f"<one:T><![CDATA[{cdata}]]></one:T>"
                             f"{children_block}"
@@ -714,6 +766,7 @@ def _markdown_to_oes(md_text: str) -> list:
                 pass  # fall through to simple flat extraction below
             # Fallback: flat extraction (no nesting)
             bullet = tag == "ul"
+            fb_counter = 0
             for item in re.findall(r"<li[^>]*>(.*?)</li>", raw, re.DOTALL):
                 item = re.sub(r"</?p[^>]*>", "", item).strip()
                 item = re.sub(r"\n+", " ", item).strip()
@@ -727,11 +780,12 @@ def _markdown_to_oes(md_text: str) -> list:
                         "</one:OE>"
                     )
                 else:
+                    fb_counter += 1
                     oes.append(
                         "<one:OE>"
                         "<one:List>"
                         "<one:Number numberSequence=\"0\" numberFormat=\"##.\""
-                        " fontSize=\"11.0\"/>"
+                        f" text=\"{fb_counter}.\" fontSize=\"11.0\"/>"
                         "</one:List>"
                         f"<one:T><![CDATA[{cdata}]]></one:T>"
                         "</one:OE>"
@@ -785,6 +839,21 @@ def _markdown_to_oes(md_text: str) -> list:
                 oes.append(table_oe)
 
     # --- Phase 3: walk split blocks and handle tokens + plain blocks ---
+    # Track whether the last processed token was a <pre> code block.  When
+    # two consecutive pre-blocks are emitted without any intervening content,
+    # their Consolas-styled OEs would all be read back as one merged fenced
+    # block.  Inserting an empty separator OE between them causes the read
+    # path to flush the first block before accumulating the second.
+    _last_token_was_pre = False
+
+    def _process_token_with_sep(token: str) -> None:
+        nonlocal _last_token_was_pre
+        tag_name = stash[token][0]
+        if tag_name == "pre" and _last_token_was_pre:
+            oes.append("<one:OE><one:T><![CDATA[]]></one:T></one:OE>")
+        _process_token(token)
+        _last_token_was_pre = (tag_name == "pre")
+
     for block in blocks:
         # A block may be a token, a plain HTML block, or mix of tokens + text.
         # Tokens are always produced by phase 1 and look like \x00TAG0\x00.
@@ -794,7 +863,25 @@ def _markdown_to_oes(md_text: str) -> list:
         # Check if the entire (stripped) block is a single token.
         stripped = block.strip()
         if re.fullmatch(r"\x00[A-Z]+\d+\x00", stripped):
-            _process_token(stripped)
+            _process_token_with_sep(stripped)
+            continue
+
+        _last_token_was_pre = False
+
+        # Horizontal rule — <hr>, <hr/>, or <hr />
+        if re.match(r"<hr[\s/>]", stripped, re.IGNORECASE):
+            # Use 32 U+2500 (BOX DRAWINGS LIGHT HORIZONTAL) chars as a
+            # plain-text sentinel.  OneNote stores text content faithfully
+            # and renders it as a visible line.  The read path detects a
+            # run of >= 8 such chars and emits '---'.
+            oes.append(
+                "<one:OE>"
+                "<one:T><![CDATA[\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+                "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+                "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+                "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500]]></one:T>"
+                "</one:OE>"
+            )
             continue
 
         # Mixed: may contain tokens interleaved with plain text fragments.
@@ -805,7 +892,7 @@ def _markdown_to_oes(md_text: str) -> list:
             if not part:
                 continue
             if re.fullmatch(r"\x00[A-Z]+\d+\x00", part):
-                _process_token(part)
+                _process_token_with_sep(part)
             else:
                 # Plain block: collapse newlines, pass as CDATA.
                 flat = re.sub(r"\n+", " ", part).strip()
