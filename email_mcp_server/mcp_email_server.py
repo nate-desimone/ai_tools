@@ -18,8 +18,10 @@ Usage:
 """
 
 import json
+import os
 import re
 import tempfile
+import winreg
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -28,6 +30,8 @@ from markdownify import markdownify as _markdownify
 import markdown as _markdown
 import pythoncom
 import win32com.client
+from PIL import Image
+import pytesseract
 
 from mcp.server.fastmcp import FastMCP
 
@@ -631,6 +635,60 @@ _TEXT_EXTENSIONS = {
     ".diff", ".patch",
 }
 
+# ---------------------------------------------------------------------------
+# Tesseract PATH auto-detection via the Windows registry
+# ---------------------------------------------------------------------------
+
+def _find_tesseract_in_registry() -> Optional[str]:
+    """Search HKLM Uninstall keys for a Tesseract-OCR entry and return its install dir."""
+    uninstall_keys = [
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+    ]
+    for key_path in uninstall_keys:
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+                i = 0
+                while True:
+                    try:
+                        subkey_name = winreg.EnumKey(key, i)
+                        with winreg.OpenKey(key, subkey_name) as subkey:
+                            try:
+                                display_name, _ = winreg.QueryValueEx(subkey, "DisplayName")
+                                if "Tesseract-OCR" in display_name:
+                                    try:
+                                        uninstall_str, _ = winreg.QueryValueEx(subkey, "UninstallString")
+                                        return str(Path(uninstall_str.strip('"')).parent)
+                                    except FileNotFoundError:
+                                        pass
+                            except FileNotFoundError:
+                                pass
+                        i += 1
+                    except OSError:
+                        break
+        except OSError:
+            continue
+    return None
+
+
+def _ensure_tesseract_on_path() -> None:
+    """Add the Tesseract-OCR directory to PATH if tesseract is not already accessible."""
+    import shutil
+    if shutil.which("tesseract"):
+        return
+    install_dir = _find_tesseract_in_registry()
+    if install_dir and install_dir not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = install_dir + os.pathsep + os.environ.get("PATH", "")
+
+
+_ensure_tesseract_on_path()
+
+# Image file extensions supported by the OCR tool.
+_IMAGE_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif",
+    ".bmp", ".tiff", ".tif", ".webp",
+}
+
 @mcp.tool()
 def read_attachment_text(
     entry_id: str,
@@ -713,6 +771,76 @@ def read_attachment_text(
         "truncated": truncated,
         "content": content,
     }, indent=2)
+
+@mcp.tool()
+def read_attachment_image_ocr(
+    entry_id: str,
+    filename: str,
+    lang: str = "eng",
+) -> str:
+    """Extract text from an image email attachment using OCR (Tesseract).
+
+    Downloads the image attachment to a temporary file, runs
+    Tesseract OCR on it, deletes the temporary file, and returns the
+    extracted text. The agent only ever sees the final text output;
+    no file paths or intermediate state are exposed.
+
+    Requires Tesseract to be installed on the system. Download from:
+    https://github.com/UB-Mannheim/tesseract/wiki
+
+    Supported image formats:
+        .png .jpg .jpeg .gif .bmp .tiff .tif .webp
+
+    Args:
+        entry_id: The EntryID of the email containing the attachment.
+        filename: The exact filename of the attachment, as returned by
+            list_attachments.
+        lang: Tesseract language code to use for OCR. Default: "eng"
+            (English). Use a valid Tesseract language code for other
+            languages (e.g. "fra" for French, "deu" for German).
+
+    Returns a JSON object containing:
+        filename, lang, char_count, text (the OCR-extracted string).
+    """
+    suffix = Path(filename).suffix.lower()
+    if suffix not in _IMAGE_EXTENSIONS:
+        raise ValueError(
+            f"'{filename}' has an unsupported extension ('{suffix}'). "
+            f"Supported image extensions: {', '.join(sorted(_IMAGE_EXTENSIONS))}."
+        )
+
+    _, namespace = _get_outlook()
+    item = namespace.GetItemFromID(entry_id)
+
+    target_att = None
+    for att in item.Attachments:
+        if att.FileName == filename:
+            target_att = att
+            break
+
+    if target_att is None:
+        raise ValueError(f"Attachment '{filename}' not found on email '{entry_id}'.")
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+
+    try:
+        target_att.SaveAsFile(str(tmp_path))
+        with Image.open(tmp_path) as img:
+            text = pytesseract.image_to_string(img, lang=lang)
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+    return json.dumps({
+        "filename": filename,
+        "lang": lang,
+        "char_count": len(text),
+        "text": text,
+    }, indent=2)
+
 
 @mcp.tool()
 def get_thread(

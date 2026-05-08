@@ -2,3 +2,5 @@ mcp[cli]
 pywin32
 markdownify
 markdown
+Pillow
+pytesseract

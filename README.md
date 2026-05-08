@@ -91,13 +91,18 @@ An [MCP](https://modelcontextprotocol.io/) server that gives AI agents read, sea
 
 **Attachments**
 - **list_attachments** - List all attachments on an email
-- **read_attachment_text** - Read the text content of a plain-text attachment directly (no permanent file saved); supports .txt, .csv, .py, .md, .json, .yaml, .xml, .html, .sh, .ps1, and more
+- **read_attachment_text** - Read the text content of a plain-text attachment directly without saving the attachment to disk; supports .txt, .csv, .py, .md, .json, .yaml, .xml, .html, .sh, .ps1, and more
+- **read_attachment_image_ocr** - Extract text from an image attachment using Tesseract OCR; supports .png, .jpg, .jpeg, .gif, .bmp, .tiff, .tif, .webp; returns OCR text as JSON without saving the attachment to disk
 - **download_attachment** - Download a specific attachment to a local directory
 
 **Drafting** *(all tools save a draft and open it in Outlook for review — nothing is sent automatically)*
 - **create_draft** - Compose a new email draft
 - **create_reply** - Create a reply to an existing email (Reply or Reply All)
 - **create_forward** - Create a forward draft for an existing email
+
+#### Prerequisites
+
+> **Tesseract OCR** must be installed on the system to use the `read_attachment_image_ocr` tool. Download the Windows installer from the [UB Mannheim Tesseract wiki](https://github.com/UB-Mannheim/tesseract/wiki).
 
 #### Setup
 
