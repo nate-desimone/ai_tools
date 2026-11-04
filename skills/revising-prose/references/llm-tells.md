@@ -174,7 +174,7 @@ LLMs pack conditions, states, and actors into dense noun phrases. The text looks
 | Vague negative object | updates nothing / changes nothing | does not update db |
 | Implicit scope | a boot in which... / afterwards | during the current boot cycle / after `ExitBootServices` |
 | Stand-in for a defined term | ...updates it / ...updates the database | ...updates db |
-| Restriction stacked on "no" | only if no UEFI Shell was loaded | only if the UEFI Shell wasn't loaded |
+| Restriction stacked on "no" | only if no UEFI Shell was loaded | only if the UEFI Shell wasn't loaded (see section 8) |
 | Negative rule split from its requirement | Release K only if A and B. If C happened, K is not released. | Release K only if A, B, and C didn't happen. |
 
 A boot is not deployed; the platform is. A boot does not update db; SMM does. When an adjective or verb attaches to something that can't have that property or do that action, find the real subject.
@@ -192,6 +192,32 @@ The passive is clearer than an ambiguous intransitive verb. "The application loa
    - Use one sentence when a list doesn't fit, such as inside an existing list item (no nested lists), in a table cell, or in a format that avoids lists.
    - In the sentence, put a condition introduced by a reporting verb ("BDS reports that...") last so the verb can't seem to cover the others.
 7. If unpacking reveals an ambiguity, such as which component checks which condition, ask the author. Don't guess.
+
+## 8. Negating the Noun Instead of the Verb
+
+LLMs put the negation on the noun with "no": "holds no secrets", "with no user interaction", "shall contain no executable code". It sounds formal and compressed. People usually negate the verb. `scan` flags "<verb> no", "with no", "only if no", and "at no point".
+
+| Pattern | LLM version | Human version |
+|---------|-------------|---------------|
+| verb + no | The variable holds no secrets. | The variable doesn't hold any secrets. |
+| has no + effect | The setting has no effect on S3 resume. | The setting doesn't affect S3 resume. |
+| has no + state | The image has no signature. | The image isn't signed. |
+| makes / takes / provides no | The driver makes no assumptions about alignment. | The driver doesn't assume anything about alignment. |
+| with no | The capsule is applied with no user interaction. | The capsule is applied without user interaction. |
+| Normative text | The image shall contain no executable code. | The image shall not contain executable code. |
+| only if no / unless no | only if no UEFI Shell was loaded | only if the UEFI Shell wasn't loaded |
+| at no point / at no time / in no way / under no circumstances | At no point is the key written to flash. | The key is never written to flash. |
+| There is no need to | There is no need to reboot. | You don't need to reboot. |
+
+**How to fix:**
+
+1. Move the negation to the verb: "holds no X" becomes "doesn't hold any X". Keep "any" when "no" meant "none at all"; drop it when the plain negative is clear.
+2. Use a stronger verb or adjective if one exists: "has no effect on" becomes "doesn't affect", "has no signature" becomes "isn't signed", and "takes no action" becomes "does nothing".
+3. Replace "with no" with "without": "with no reboot" becomes "without a reboot".
+4. In normative text, attach the negation to the keyword: "shall contain no" becomes "shall not contain". Never change the keyword itself.
+5. Match the author's contractions: "doesn't" if the author uses contractions, "does not" if not.
+
+**Keep:** fixed phrases and spec limits such as no longer, no one, no matter, no-op, no-execute (NX), no more than, no fewer than, and no later than, plus "No" as an answer or table value.
 
 ---
 

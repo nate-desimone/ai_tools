@@ -1,6 +1,6 @@
 ---
 name: revising-prose
-description: 'Revise a document for redundancy, conciseness, clarity, and a human voice using Richard Lanham''s "Revising Prose" (the Paramedic Method and the Lard Factor). Use when: asked to edit, tighten, trim, shorten, cut word count, proofread for wordiness, simplify, de-jargon, improve readability or flow, or make AI/LLM-generated text sound human-written. Fixes bureaucratic "Official Style" prose, passive voice, nominalizations, prepositional-phrase strings, "is" verbs, noun stacks, slow windups, redundant phrases, empty hedges, double negatives, and LLM tells (delve, robust, pinned, "lives in", em-dash overuse, "not just X, but Y", trailing ", ensuring..." clauses). Works on Markdown, plain text, emails, self-evaluations, design docs, READMEs, and reports. Edits in place and reports the Lard Factor.'
+description: 'Revise a document for redundancy, conciseness, clarity, and a human voice using Richard Lanham''s "Revising Prose" (the Paramedic Method and the Lard Factor). Use when: asked to edit, tighten, trim, shorten, cut word count, proofread for wordiness, simplify, de-jargon, improve readability or flow, or make AI/LLM-generated text sound human-written. Fixes bureaucratic "Official Style" prose, passive voice, nominalizations, prepositional-phrase strings, "is" verbs, noun stacks, slow windups, redundant phrases, empty hedges, double negatives, and LLM tells (delve, robust, pinned, "lives in", "holds no", "with no", em-dash overuse, "not just X, but Y", trailing ", ensuring..." clauses). Works on Markdown, plain text, emails, self-evaluations, design docs, READMEs, and reports. Edits in place and reports the Lard Factor.'
 argument-hint: 'File to revise; optionally the audience, a target word count, or "review only"'
 ---
 
@@ -111,6 +111,7 @@ Apply this pass to every document, whoever drafted it. Work from the "LLM tells"
 - **Punctuation and formatting:** about one em dash per paragraph at most; no arrows or emoji in prose; bold only for defined terms and warnings; prose instead of bullets when the ideas connect.
 - **Content:** generic claims where the author would give specifics, uniform confidence, and actions without actors. **Never invent the specifics**; flag them for the author.
 - **Over-compression:** conditions hidden in noun phrases ("only in a boot in which..."), modifiers on the wrong noun ("a deployed, secure boot"), and events as actors ("A boot ... updates nothing"). Unpack them even when that adds words.
+- **Negated nouns:** "holds no secrets" becomes "doesn't hold any secrets", "with no user interaction" becomes "without user interaction", and "shall contain no" becomes "shall not contain". Negate the verb, not the noun.
 
 Don't swap one LLM word for another ("delve" → "explore", "robust" → "resilient"). Don't over-correct either: an occasional em dash or list of three is normal.
 
@@ -125,7 +126,7 @@ Don't swap one LLM word for another ("delve" → "explore", "robust" → "resili
 - **Measure:** Run `compare <temp-copy> <file>`.
   - Low LF on Official Style text (under about 10%) means you should do another pass.
   - High LF (over about 50%) means you should check the meaning again before reporting.
-- **Re-scan:** Run `scan` on the revision. Any remaining flags should be deliberate.
+- **Re-scan:** Run `scan` on the revision. Fix every remaining "LLM tells" hit, or keep it on purpose and list it under "Please review" with the reason (for example, "no later than" is a spec limit).
 - **Format:** Make sure the Markdown still renders: headings, lists, tables, links, and code fences are intact. Check for editor errors or lint warnings if available.
 
 ### 9. Report
@@ -172,7 +173,7 @@ When the document uses normative keywords (shall, must, required), precision out
 - **Keep normative keywords exactly as written.** Don't change shall, must, should, or may, or their negatives, into each other or into "will". They carry defined meanings (RFC 2119/8174 or the spec's own conventions).
 - **Write conditions as conditions:** use if, only if, when, or unless, not a noun with an "in which" clause.
 - **Fold a separate negative rule into the conditions.** "Release K only if A and B. If C happened, don't release K." means "Release K only if A, B, and C didn't happen." One requirement is shorter and can't be read as two independent rules.
-- **After "only if", negate the verb, not the noun:** "only if the UEFI Shell wasn't loaded", not "only if no UEFI Shell was loaded". Use contractions where the author does, but never contract normative keywords (shall not, must not).
+- **Negate the verb, not the noun:** "shall not contain executable code", not "shall contain no executable code"; "only if the UEFI Shell wasn't loaded", not "only if no UEFI Shell was loaded". Use contractions where the author does, but never contract normative keywords (shall not, must not).
 - **One condition per clause, each with its real subject.** "The platform is in Deployed Mode" and "Secure Boot is enabled" are separate conditions, not "a deployed, secure boot".
 - **Prefer a list for three or more conditions:** "only if:" followed by the items, with "; and" (AND) or "; or" (OR) before the last one.
   - Use one sentence instead when a list doesn't fit. Examples: the requirement already sits in a list item and nesting would clutter it, it's in a table cell, or the document's format avoids lists.

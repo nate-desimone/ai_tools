@@ -235,6 +235,11 @@ def _words(pattern: str) -> str:
     return rf"\b(?:{pattern})\b"
 
 
+# Fixed phrases and spec limits where "no" is idiomatic.
+_NO_IDIOMS = (r"(?!-)(?! (?:longer|one|matter|more|less|fewer|later|earlier|sooner|greater|smaller|larger|bigger)\b)"
+              r"(?=\s+\w)")
+
+
 # Habits that make text sound machine-written. Patterns avoid terms of art where possible
 # (GPIO pins, attack surface, trust anchor, clock gating, test harness, elevated privileges).
 LLM_TELLS = [
@@ -306,6 +311,12 @@ LLM_TELLS = [
      "condition as noun + clause: use if / only if / when"),
     (_words(r"[a-z]+(?:s|ed) nothing"), "vague negative: 'does not <verb> <named object>'"),
     (_words(r"only if no|unless no|except (?:when|if) no"), "negate the verb: 'only if a <noun> wasn't <verb>'"),
+    (_words(r"with no" + _NO_IDIOMS), "use 'without': 'with no X' -> 'without X' / 'without any X'"),
+    (_words(r"(?:[a-z]+(?:s|ed)|had|held|made|took|kept|left|gave|saw|got|found|sent|have|hold|contain|carry|require|need"
+            r"|take|make|provide|offer|perform|expose|store|retain|keep|leave|see|get|receive|return|produce|include|use"
+            r"|allow|give|show|report|incur|add|introduce|impose|be) no" + _NO_IDIOMS),
+     "negated noun: negate the verb ('doesn't hold any X', 'shall not contain X')"),
+    (_words(r"at no (?:point|time)|in no way|under no circumstances|by no means"), "never / not"),
 ]
 LLM_RES = [(re.compile(p, re.I), s) for p, s in LLM_TELLS]
 NORMATIVE_RE = re.compile(r"\b(?:shall|must|required)\b", re.I)
