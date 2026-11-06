@@ -92,13 +92,17 @@ An [MCP](https://modelcontextprotocol.io/) server that gives AI agents read, sea
 **Attachments**
 - **list_attachments** - List all attachments on an email
 - **read_attachment_text** - Read the text content of a plain-text attachment directly without saving the attachment to disk; supports .txt, .csv, .py, .md, .json, .yaml, .xml, .html, .sh, .ps1, and more
-- **read_attachment_image_ocr** - Extract text from an image attachment using Tesseract OCR; supports .png, .jpg, .jpeg, .gif, .bmp, .tiff, .tif, .webp; returns OCR text as JSON without saving the attachment to disk
+- **read_attachment_image_ocr** - Extract text from an image attachment using Tesseract OCR; supports .png, .jpg, .jpeg, .gif, .bmp, .tiff, .tif, .webp; returns OCR text as Markdown without saving the attachment to disk
 - **download_attachment** - Download a specific attachment to a local directory
 
 **Drafting** *(all tools save a draft and open it in Outlook for review — nothing is sent automatically)*
 - **create_draft** - Compose a new email draft
 - **create_reply** - Create a reply to an existing email (Reply or Reply All)
 - **create_forward** - Create a forward draft for an existing email
+
+#### Output format
+
+Every tool returns a single Markdown document: an H1 title, `- **field:** value` bullets for scalar fields (identifiers in code spans), GitHub-flavored tables for lists of records (`_None._` when empty), and fenced code blocks for free-form text such as email bodies and attachment contents. The fence is always longer than any backtick run in the text, so content containing its own code fences stays unambiguous. See the module docstring in `mcp_email_server.py` for the full specification.
 
 #### Prerequisites
 

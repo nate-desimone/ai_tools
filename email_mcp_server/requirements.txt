@@ -1,6 +1,7 @@
 mcp[cli]
 pywin32
 markdownify
+beautifulsoup4
 markdown
 Pillow
 pytesseract

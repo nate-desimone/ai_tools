@@ -13,11 +13,28 @@ Outlook on Windows systems.
 Requires Microsoft Outlook to be installed. The server will start Outlook
 automatically if it is not already running.
 
+Response format:
+    Every tool returns one Markdown document.
+
+    - The first line is an H1 title naming the result (e.g. "# Emails").
+    - Scalar fields are bullets of the form "- **field_name:** value".
+      Identifiers, addresses, and paths are in code spans. Booleans are
+      true/false. Lists of scalars are nested bullets. A field with no value
+      (such as the sender of an unsent draft) is omitted.
+    - Lists of records are GitHub-flavored tables whose header cells are the
+      field names. A literal "|" in a cell is written "\\|". An empty list is
+      the line "_None._".
+    - Free-form text (email bodies, attachment contents) is in a fenced code
+      block whose fence is longer than any backtick run in the text, so the
+      text is everything between the opening and closing fence.
+    - A document holding several records (get_thread) has one "##" section
+      per record.
+    - Failures are raised as errors, which MCP reports as tool errors.
+
 Usage:
     python mcp_email_server.py
 """
 
-import json
 import os
 import re
 import tempfile
@@ -26,7 +43,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from markdownify import markdownify as _markdownify
+from bs4 import BeautifulSoup
+from markdownify import MarkdownConverter
 import markdown as _markdown
 import pythoncom
 import win32com.client
@@ -95,6 +113,51 @@ def _resolve_folder(namespace, account_name: str, folder_path: str):
     return folder
 
 
+# MAPI properties holding SMTP addresses. Exchange mail otherwise exposes only
+# an X.500 address (/O=EXCHANGELABS/...), and neither property is set on every
+# message, so senders are tried against both.
+_PR_SENDER_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x5D01001F"
+_PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F"
+
+
+def _mapi_string(obj, tag: str) -> str:
+    """Read a MAPI string property from *obj*, or "" when it is unavailable."""
+    try:
+        return obj.PropertyAccessor.GetProperty(tag) or ""
+    except Exception:
+        return ""
+
+
+def _sender_address(item) -> str:
+    """Return the sender's SMTP address, or the raw address if it cannot be resolved."""
+    try:
+        address = item.SenderEmailAddress or ""
+        is_exchange = item.SenderEmailType == "EX"
+    except Exception:
+        return ""
+    if not is_exchange:
+        return address
+
+    smtp = _mapi_string(item, _PR_SENDER_SMTP_ADDRESS)
+    if not smtp:
+        try:
+            smtp = _mapi_string(item.Sender, _PR_SMTP_ADDRESS)
+        except Exception:
+            pass
+    return smtp or address
+
+
+def _recipient_address(recipient) -> str:
+    """Return a recipient's SMTP address, else its raw address, else its name."""
+    smtp = _mapi_string(recipient, _PR_SMTP_ADDRESS)
+    if smtp:
+        return smtp
+    try:
+        return recipient.Address or recipient.Name
+    except Exception:
+        return recipient.Name
+
+
 def _mail_item_summary(item) -> dict:
     """Return a concise summary dict for a MailItem."""
     try:
@@ -104,7 +167,7 @@ def _mail_item_summary(item) -> dict:
         received_str = None
 
     try:
-        sender_email = item.SenderEmailAddress
+        sender_email = _sender_address(item)
     except Exception:
         sender_email = ""
 
@@ -123,6 +186,137 @@ def _mail_item_summary(item) -> dict:
         "is_unread": bool(item.UnRead),
         "conversation_id": conversation_id,
     }
+
+
+# ---------------------------------------------------------------------------
+# Markdown rendering
+# ---------------------------------------------------------------------------
+
+_NONE = "_None._"
+
+
+def _inline(value) -> str:
+    """Return *value* as a single line of text (line breaks become spaces)."""
+    if value is None:
+        return ""
+    return " ".join(p.strip() for p in str(value).splitlines() if p.strip())
+
+
+def _scalar(value) -> str:
+    """Return a bool as true/false and anything else as a single line."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return _inline(value)
+
+
+def _lf(text: str) -> str:
+    """Return *text* with every line ending as a bare newline."""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _longest_backtick_run(text: str) -> int:
+    return max((len(m) for m in re.findall(r"`+", text)), default=0)
+
+
+def _code(value) -> str:
+    """Return *value* as an inline code span, or "" when it is empty."""
+    text = _inline(value)
+    if not text:
+        return ""
+    ticks = "`" * (_longest_backtick_run(text) + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{ticks}{pad}{text}{pad}{ticks}"
+
+
+def _fence(text: str, info: str = "") -> str:
+    """Return *text* in a fenced code block that no line of *text* can close."""
+    text = _lf(text)
+    ticks = "`" * max(3, _longest_backtick_run(text) + 1)
+    return f"{ticks}{info}\n{text}\n{ticks}"
+
+
+def _kv(**fields) -> str:
+    """Render *fields* as "- **name:** value" bullets, skipping empty ones.
+
+    List values become nested bullets.
+    """
+    lines = []
+    for name, value in fields.items():
+        if isinstance(value, (list, tuple)):
+            items = [text for text in map(_inline, value) if text]
+            if items:
+                lines.append(f"- **{name}:**")
+                lines.extend(f"  - {text}" for text in items)
+        else:
+            text = _scalar(value)
+            if text:
+                lines.append(f"- **{name}:** {text}")
+    return "\n".join(lines)
+
+
+def _table(columns: list, rows: list) -> str:
+    """Render a GitHub-flavored table, or "_None._" when there are no rows."""
+    if not rows:
+        return _NONE
+
+    def _line(cells) -> str:
+        return "| " + " | ".join(_scalar(c).replace("|", "\\|") for c in cells) + " |"
+
+    separator = "|" + "|".join(["---"] * len(columns)) + "|"
+    return "\n".join([_line(columns), separator, *(_line(r) for r in rows)])
+
+
+def _doc(*blocks: str) -> str:
+    """Join non-empty Markdown blocks with blank lines."""
+    return "\n\n".join(b for b in blocks if b)
+
+
+_EMAIL_COLUMNS = [
+    "received_time", "sender_name", "sender_email", "subject",
+    "is_unread", "has_attachments", "entry_id", "conversation_id",
+]
+
+
+def _email_table(summaries: list) -> str:
+    """Render _mail_item_summary dicts as a table with _EMAIL_COLUMNS."""
+    return _table(
+        _EMAIL_COLUMNS,
+        [
+            (
+                s["received_time"], s["sender_name"], _code(s["sender_email"]),
+                s["subject"], s["is_unread"], s["has_attachments"],
+                _code(s["entry_id"]), _code(s["conversation_id"]),
+            )
+            for s in summaries
+        ],
+    )
+
+
+def _email_block(heading: str, entry: dict, level: int) -> str:
+    """Render a full email (summary dict plus body fields) as a section."""
+    marks = "#" * level
+    return _doc(
+        f"{marks} {heading}",
+        _kv(
+            entry_id=_code(entry["entry_id"]),
+            conversation_id=_code(entry["conversation_id"]),
+            subject=entry["subject"],
+            sender_name=entry["sender_name"],
+            sender_email=_code(entry["sender_email"]),
+            recipients=[_code(r) for r in entry["recipients"]],
+            received_time=entry["received_time"],
+            is_unread=entry["is_unread"],
+            has_attachments=entry["has_attachments"],
+            attachment_count=entry["attachment_count"],
+            body_format=entry["body_format"],
+        ),
+        f"{marks}# Body",
+        _fence(entry["body"], entry["body_format"]),
+    )
+
+
+def _draft_result(title: str, entry_id: str, message: str) -> str:
+    return _doc(f"# {title}", _kv(entry_id=_code(entry_id), message=message))
 
 
 _MD_EXTENSIONS = ["fenced_code", "tables"]
@@ -158,6 +352,192 @@ def _prepend_html(fragment: str, existing_html: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Email body (HTML to Markdown)
+# ---------------------------------------------------------------------------
+
+# It is common for Email HTML to use tables for page layout, which can make it
+# difficult to determine if a HTML table is truly tabular data. Markdownify turns
+# every table into a Markdown table, leaking nested tables into cells as literal
+# pipes. To improve the readability, apply heuristics to attempt to categorize
+# tables as layout versus data. Tables judged to be layout are unwrapped into
+# plain blocks.
+
+_LAYOUT_ROLES = ("presentation", "none")
+_DATA_ROLES = ("table", "grid")
+_BLOCK_TAGS = {
+    "p", "div", "ul", "ol", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+    "pre", "blockquote", "hr", "table",
+}
+_TABLE_PARTS = ["td", "th", "tr", "tbody", "thead", "tfoot", "caption"]
+# A multi-line cell holding more than this many characters is prose, not data.
+_PROSE_CELL_CHARS = 160
+_DATA_VALUE_RE = re.compile(r"[\d.,/:_-]+")
+
+
+def _own(table, names):
+    """Return the descendants of *table* named in *names*, excluding nested tables'."""
+    return [e for e in table.find_all(names) if e.find_parent("table") is table]
+
+
+def _colspan(cell) -> int:
+    try:
+        return max(1, int(cell.get("colspan", 1)))
+    except ValueError:
+        return 1
+
+
+def _is_multiline(cell) -> bool:
+    blocks = [
+        e for e in cell.find_all(True)
+        if e.name in _BLOCK_TAGS and e.find_parent(["td", "th"]) is cell
+    ]
+    return len(blocks) > 1 or len(cell.find_all("br")) > 1
+
+
+def _is_data_table(table) -> bool:
+    """Return True when *table* holds tabular data rather than page layout."""
+    role = (table.get("role") or "").lower()
+    if table.find("table") is not None or role in _LAYOUT_ROLES:
+        return False
+
+    rows = [row.find_all(["td", "th"], recursive=False) for row in _own(table, "tr")]
+    cols = max((sum(_colspan(c) for c in row) for row in rows), default=0)
+    if _own(table, ["th", "thead"]) or table.find("caption") is not None or role in _DATA_ROLES:
+        return cols >= 2
+    if len(rows) < 2 or cols < 2:
+        return False
+
+    cells = [c for row in rows for c in row]
+    first = [c.get_text(" ", strip=True) for c in rows[0]]
+    # Empty-first-column grids are comment threads, legends, and cards.
+    if not first or sum(1 for t in first if t) < 0.5 * len(first):
+        return False
+    if all(not row[0].get_text(strip=True) for row in rows if row):
+        return False
+
+    multiline = sum(1 for c in cells if _is_multiline(c))
+    longest = max((len(c.get_text(" ", strip=True)) for c in cells), default=0)
+    return not (multiline > 0.25 * len(cells) and longest > _PROSE_CELL_CHARS)
+
+
+def _looks_like_header(row: list) -> bool:
+    """Return False when *row* reads as a record: a "Label:" or mostly IDs and numbers."""
+    if row and row[0].endswith(":"):
+        return False
+    return sum(bool(_DATA_VALUE_RE.fullmatch(t)) for t in row) < max(1, len(row) // 2)
+
+
+def _unwrap_layout_tables(soup) -> None:
+    """Flatten layout tables to divs and give header-less data tables a header row."""
+    tables = soup.find_all("table")
+    data = {id(t) for t in tables if _is_data_table(t)}
+    for table in reversed(tables):  # inner tables first
+        if id(table) in data:
+            rows = _own(table, "tr")
+            if rows and not _own(table, "th"):
+                first = rows[0].find_all(["td", "th"], recursive=False)
+                if _looks_like_header([c.get_text(" ", strip=True) for c in first]):
+                    for cell in first:
+                        cell.name = "th"
+        else:
+            for tag in _own(table, _TABLE_PARTS):
+                tag.name = "div"
+            table.name = "div"
+
+
+_PR_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
+# Images at most this many pixels wide or tall are tracking pixels and spacers.
+_TRACKING_PIXEL_PX = 2
+
+
+def _pixels(img, dimension: str):
+    """Return the declared "width" or "height" of *img* in pixels, or None."""
+    number = r"(\d+(?:\.\d+)?)"
+    match = re.fullmatch(rf"\s*{number}\s*(?:px)?\s*", img.get(dimension) or "")
+    if not match:
+        match = re.search(rf"(?<![-\w]){dimension}\s*:\s*{number}\s*px", img.get("style") or "")
+    return float(match.group(1)) if match else None
+
+
+def _is_decorative_image(img) -> bool:
+    """Return True for tracking pixels, spacers, and hidden images."""
+    style = re.sub(r"\s+", "", img.get("style") or "").lower()
+    if "display:none" in style or "visibility:hidden" in style or img.has_attr("hidden"):
+        return True
+    sizes = (_pixels(img, "width"), _pixels(img, "height"))
+    return any(s is not None and s <= _TRACKING_PIXEL_PX for s in sizes)
+
+
+def _image_target(src: str, inline_images: dict) -> str:
+    """Return a reachable, compact reference for an <img> *src*."""
+    src = src.strip()
+    lowered = src.lower()
+    if lowered.startswith("cid:"):
+        cid = lowered[4:]
+        name = inline_images.get(cid) or inline_images.get(cid.split("@")[0])
+        return f"attachment:{name}" if name else src
+    if lowered.startswith("data:"):
+        return src.split(";", 1)[0].split(",", 1)[0]
+    return src
+
+
+def _mark_images(soup, inline_images: dict) -> None:
+    """Drop decorative images and rewrite the rest's alt and src for output."""
+    for img in soup.find_all("img"):
+        if not (img.get("src") or "").strip() or _is_decorative_image(img):
+            img.decompose()
+            continue
+        img["alt"] = " ".join((img.get("alt") or img.get("title") or "").split())
+        img["src"] = _image_target(img["src"], inline_images)
+
+
+class _EmailMarkdown(MarkdownConverter):
+    """MarkdownConverter that keeps images everywhere, even in table cells and headings."""
+
+    def convert_img(self, el, *args, **kwargs):
+        alt = " ".join(re.sub(r"[\[\]|]", "", el.get("alt") or "").split())
+        target = (el.get("src") or "").replace("|", "%7C")
+        if re.search(r"[\s()]", target):
+            target = "<" + target.replace("<", "%3C").replace(">", "%3E") + ">"
+        return f"![{alt}]({target})"
+
+
+def _html_to_markdown(html: str, inline_images: Optional[dict] = None) -> str:
+    """Convert an email's HTML body to Markdown.
+
+    Data tables stay tables, layout tables are flattened, and images are kept as
+    ![alt](target) except tracking pixels. *inline_images* maps Content-IDs to
+    attachment filenames.
+    """
+    lowered = html.lower()
+    if "<table" in lowered or "<img" in lowered:
+        soup = BeautifulSoup(html, "html.parser")
+        _mark_images(soup, inline_images or {})
+        _unwrap_layout_tables(soup)
+        html = str(soup)
+    return _EmailMarkdown().convert(html).strip()
+
+
+def _inline_images(item) -> dict:
+    """Map each attachment's Content-ID (lowercase) to its filename."""
+    images = {}
+    for att in item.Attachments:
+        cid = _mapi_string(att, _PR_ATTACH_CONTENT_ID)
+        if cid:
+            images[cid.lower()] = att.FileName
+    return images
+
+
+def _item_body(item) -> tuple:
+    """Return (body, body_format) for a MailItem: Markdown from its HTML, else plain text."""
+    html = item.HTMLBody
+    if not html:
+        return item.Body or "", "plain"
+    images = _inline_images(item) if "cid:" in html.lower() else {}
+    return _html_to_markdown(html, images), "markdown"
+
+
+# ---------------------------------------------------------------------------
 # Query-string parser
 # ---------------------------------------------------------------------------
 
@@ -170,7 +550,7 @@ def _prepend_html(fragment: str, existing_html: str) -> str:
 #   before:<YYYY-MM-DD> → until  (also accepts YYYY/MM/DD)
 #   newer_than:<value>  → alias for after:
 #   older_than:<value>  → alias for before:
-# Remaining unrecognised tokens are joined and used as a body substring filter.
+# Remaining unrecognized tokens are joined and used as a body substring filter.
 _QUERY_TOKEN_RE = re.compile(
     r'(from|subject|body|after|before|newer_than|older_than):("[^"]*"|\S+)',
     re.IGNORECASE,
@@ -231,29 +611,27 @@ def _parse_query(
 # Tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def list_email_accounts() -> str:
     """List all email accounts configured in the local Outlook MAPI profile.
 
-    Returns a newline-separated list of accounts in the format
-    "DisplayName <email>".
+    Returns Markdown: a "# Email Accounts" heading, a "count" bullet, and a
+    table with the columns account_name and email_address. Pass account_name
+    to the other tools.
     """
     _, namespace = _get_outlook()
-    lines = []
-    for account in namespace.Accounts:
-        display = account.DisplayName or ""
-        email = account.SmtpAddress or ""
-        if email:
-            lines.append(f"{display} <{email}>")
-        else:
-            lines.append(display)
-
-    if not lines:
-        return "No accounts found in the Outlook MAPI profile."
-    return "\n".join(lines)
+    rows = [
+        (_code(account.DisplayName), _code(account.SmtpAddress))
+        for account in namespace.Accounts
+    ]
+    return _doc(
+        "# Email Accounts",
+        _kv(count=len(rows)),
+        _table(["account_name", "email_address"], rows),
+    )
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def list_folders(account_name: str, recursive: bool = False) -> str:
     """List folders in an Outlook account.
 
@@ -263,7 +641,10 @@ def list_folders(account_name: str, recursive: bool = False) -> str:
         recursive: When True, lists all sub-folders at every depth.
             When False (default), lists only the top-level folders.
 
-    Returns a text tree showing each folder name and its item count.
+    Returns Markdown: a "# Folders" heading, bullets for account_name,
+    recursive, and count, and a table with the columns folder_path and
+    item_count. folder_path is relative to the account root and can be passed
+    directly to the other tools.
     """
     _, namespace = _get_outlook()
 
@@ -280,25 +661,33 @@ def list_folders(account_name: str, recursive: bool = False) -> str:
             f"Available accounts: {available}"
         )
 
-    lines = []
+    rows = []
 
-    def _walk(folder, indent: int):
+    def _walk(folder, path: str):
         try:
             count = folder.Items.Count
         except Exception:
-            count = "?"
-        lines.append("  " * indent + f"{folder.Name}  ({count} items)")
+            count = None
+        rows.append((_code(path), count))
         if recursive:
             for sub in folder.Folders:
-                _walk(sub, indent + 1)
+                _walk(sub, f"{path}/{sub.Name}")
 
     for top in root_folder.Folders:
-        _walk(top, 0)
+        _walk(top, top.Name)
 
-    return "\n".join(lines) if lines else "No folders found."
+    return _doc(
+        "# Folders",
+        _kv(
+            account_name=_code(account_name),
+            recursive=recursive,
+            count=len(rows),
+        ),
+        _table(["folder_path", "item_count"], rows),
+    )
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def list_emails(
     account_name: str,
     folder_path: str = "Inbox",
@@ -324,9 +713,11 @@ def list_emails(
             received on or before this date are returned.
         unread_only: When True, only unread emails are returned. Default: False.
 
-    Returns a JSON array of email summary objects, each containing:
-        entry_id, subject, sender_name, sender_email, received_time,
-        has_attachments, is_unread, conversation_id.
+    Returns Markdown: a "# Emails" heading, bullets for account_name,
+    folder_path, and count, and a table with one row per email and the
+    columns received_time, sender_name, sender_email, subject, is_unread,
+    has_attachments, entry_id, and conversation_id. Pass entry_id to
+    get_email and conversation_id to get_thread.
     """
     max_count = max(1, min(max_results, 100))
     _, namespace = _get_outlook()
@@ -371,10 +762,18 @@ def list_emails(
         except Exception:
             continue
 
-    return json.dumps(results, indent=2)
+    return _doc(
+        "# Emails",
+        _kv(
+            account_name=_code(account_name),
+            folder_path=_code(folder_path),
+            count=len(results),
+        ),
+        _email_table(results),
+    )
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def search_emails(
     account_name: str,
     folder_path: str = "Inbox",
@@ -426,10 +825,12 @@ def search_emails(
             date are returned. Example: until="2026-04-02".
         max_results: Maximum number of results to return (1-100). Default: 20.
 
-    Returns a JSON array of matching email summary objects, each containing:
-        entry_id, subject, sender_name, sender_email, received_time,
-        has_attachments, is_unread, conversation_id.
-    Returns an empty array if no emails match.
+    Returns a Markdown list of emails: a "# Search Results" heading, bullets
+    for account_name, folder_path, and count, and a table with one row per
+    match and the columns received_time, sender_name, sender_email, subject,
+    is_unread, has_attachments, entry_id, and conversation_id. Pass entry_id
+    to get_email and conversation_id to get_thread. When nothing matches, the
+    table is replaced by the line "_None._".
     """
     if query:
         subject, sender, body, since, until = _parse_query(
@@ -500,7 +901,7 @@ def search_emails(
                     pass
             if sender_lower:
                 name_match = sender_lower in (item.SenderName or "").lower()
-                email_match = sender_lower in (item.SenderEmailAddress or "").lower()
+                email_match = sender_lower in _sender_address(item).lower()
                 if not name_match and not email_match:
                     continue
             if body_lower:
@@ -510,44 +911,48 @@ def search_emails(
         except Exception:
             continue
 
-    return json.dumps(results, indent=2)
+    return _doc(
+        "# Search Results",
+        _kv(
+            account_name=_code(account_name),
+            folder_path=_code(folder_path),
+            count=len(results),
+        ),
+        _email_table(results),
+    )
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def get_email(entry_id: str) -> str:
     """Retrieve the full content of a single email by its entry ID.
 
     The body is returned as Markdown converted from the HTML source when
-    available, preserving hyperlinks, tables, headings, and formatting that
-    Outlook's plain-text rendering would otherwise discard. Falls back to
-    Outlook's plain-text Body if no HTML source is present.
+    available, preserving hyperlinks, headings, and formatting that
+    Outlook's plain-text rendering would otherwise discard. Tables that hold
+    data become Markdown tables; tables used only for page layout are
+    flattened to plain paragraphs. Falls back to Outlook's plain-text Body if
+    no HTML source is present.
+
+    Images appear in place as ![alt](target). The target is an attachment
+    ("attachment:image001.png"; pass the filename to read_attachment_image_ocr
+    to read text inside it) or an image URL. Tracking pixels are omitted.
 
     Args:
         entry_id: The EntryID string from a previous list_emails or
             search_emails call.
 
-    Returns a JSON object containing:
-        entry_id, subject, sender_name, sender_email, received_time,
-        has_attachments, body (Markdown), body_format ("markdown" or "plain"),
-        recipients (list of addresses), attachment_count.
+    Returns Markdown: an "# Email" heading, a bullet list of entry_id,
+    conversation_id, subject, sender_name, sender_email, recipients (nested
+    bullets), received_time, is_unread, has_attachments, attachment_count,
+    and body_format ("markdown" or "plain"), then a "## Body" section whose
+    fenced code block holds the body text.
     """
     _, namespace = _get_outlook()
     item = namespace.GetItemFromID(entry_id)
 
-    recipients = []
-    for r in item.Recipients:
-        try:
-            recipients.append(r.Address or r.Name)
-        except Exception:
-            recipients.append(r.Name)
+    recipients = [_recipient_address(r) for r in item.Recipients]
 
-    html_body = item.HTMLBody
-    if html_body:
-        body = _markdownify(html_body, strip=["img"]).strip()
-        body_format = "markdown"
-    else:
-        body = item.Body or ""
-        body_format = "plain"
+    body, body_format = _item_body(item)
 
     result = _mail_item_summary(item)
     result["body"] = body
@@ -555,18 +960,19 @@ def get_email(entry_id: str) -> str:
     result["recipients"] = recipients
     result["attachment_count"] = item.Attachments.Count
 
-    return json.dumps(result, indent=2)
+    return _email_block("Email", result, 1)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def list_attachments(entry_id: str) -> str:
     """List all attachments on an email.
 
     Args:
         entry_id: The EntryID of the email containing the attachments.
 
-    Returns a JSON array of attachment objects, each containing:
-        filename, size_bytes, attachment_type.
+    Returns Markdown: an "# Attachments" heading, bullets for entry_id and
+    count, and a table with the columns filename, size_bytes, and
+    attachment_type.
 
     attachment_type values: 1 = By Value, 2 = By Reference,
     4 = Embedded Item, 5 = OLE.
@@ -574,18 +980,19 @@ def list_attachments(entry_id: str) -> str:
     _, namespace = _get_outlook()
     item = namespace.GetItemFromID(entry_id)
 
-    results = []
-    for att in item.Attachments:
-        results.append({
-            "filename": att.FileName,
-            "size_bytes": att.Size,
-            "attachment_type": att.Type,
-        })
+    rows = [
+        (_code(att.FileName), att.Size, att.Type)
+        for att in item.Attachments
+    ]
 
-    return json.dumps(results, indent=2)
+    return _doc(
+        "# Attachments",
+        _kv(entry_id=_code(entry_id), count=len(rows)),
+        _table(["filename", "size_bytes", "attachment_type"], rows),
+    )
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def download_attachment(entry_id: str, filename: str, output_dir: str) -> str:
     """Download a specific email attachment to a local directory.
 
@@ -596,7 +1003,8 @@ def download_attachment(entry_id: str, filename: str, output_dir: str) -> str:
         output_dir: Absolute path to the directory where the file will be
             saved. The directory must already exist.
 
-    Returns the absolute path of the saved file.
+    Returns Markdown: an "# Attachment Downloaded" heading and bullets for
+    filename and path (the absolute path of the saved file).
     """
     output_dir_path = Path(output_dir).resolve()
     if not output_dir_path.is_dir():
@@ -619,7 +1027,10 @@ def download_attachment(entry_id: str, filename: str, output_dir: str) -> str:
     for att in item.Attachments:
         if att.FileName == filename:
             att.SaveAsFile(str(output_path))
-            return str(output_path)
+            return _doc(
+                "# Attachment Downloaded",
+                _kv(filename=_code(filename), path=_code(output_path)),
+            )
 
     raise ValueError(f"Attachment '{filename}' not found on email '{entry_id}'.")
 
@@ -688,8 +1099,14 @@ _IMAGE_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif",
     ".bmp", ".tiff", ".tif", ".webp",
 }
+# Inline images from Teams and Jira are often attached with no file extension.
+_PR_ATTACH_MIME_TAG = "http://schemas.microsoft.com/mapi/proptag/0x370E001F"
+_IMAGE_MIME_TYPES = {
+    "image/png", "image/jpeg", "image/gif",
+    "image/bmp", "image/tiff", "image/webp",
+}
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def read_attachment_text(
     entry_id: str,
     filename: str,
@@ -718,11 +1135,13 @@ def read_attachment_text(
         encoding: Text encoding to use when decoding the file.
             Default: "utf-8". Common alternatives: "latin-1", "cp1252".
         max_chars: Maximum number of characters to return. Content beyond
-            this limit is truncated and a notice is appended.
+            this limit is cut off and "truncated" is true.
             Default: 100,000.
 
-    Returns a JSON object containing:
-        filename, encoding, char_count, truncated (bool), content (str).
+    Returns Markdown: an "# Attachment Text" heading, bullets for filename,
+    encoding, char_count (the length of the text returned), and truncated,
+    then a "## Content" section whose fenced code block holds the file text.
+    When truncated, a line after the block states the limit.
     """
     suffix = Path(filename).suffix.lower()
     if suffix not in _TEXT_EXTENSIONS:
@@ -759,20 +1178,25 @@ def read_attachment_text(
         except OSError:
             pass
 
-    content = raw.decode(encoding, errors="replace")
+    content = _lf(raw.decode(encoding, errors="replace"))
     truncated = len(content) > max_chars
     if truncated:
-        content = content[:max_chars] + f"\n\n[... truncated at {max_chars:,} characters ...]"
+        content = content[:max_chars]
 
-    return json.dumps({
-        "filename": filename,
-        "encoding": encoding,
-        "char_count": len(content),
-        "truncated": truncated,
-        "content": content,
-    }, indent=2)
+    return _doc(
+        "# Attachment Text",
+        _kv(
+            filename=_code(filename),
+            encoding=encoding,
+            char_count=len(content),
+            truncated=truncated,
+        ),
+        "## Content",
+        _fence(content),
+        f"_Truncated at {max_chars:,} characters._" if truncated else "",
+    )
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def read_attachment_image_ocr(
     entry_id: str,
     filename: str,
@@ -790,24 +1214,23 @@ def read_attachment_image_ocr(
 
     Supported image formats:
         .png .jpg .jpeg .gif .bmp .tiff .tif .webp
+    An attachment with no file extension is also accepted when its MIME type
+    is one of these image types (typical of inline images from Teams or Jira).
 
     Args:
         entry_id: The EntryID of the email containing the attachment.
         filename: The exact filename of the attachment, as returned by
-            list_attachments.
+            list_attachments or shown in an image reference such as
+            ![alt](attachment:image001.png) in get_email output.
         lang: Tesseract language code to use for OCR. Default: "eng"
             (English). Use a valid Tesseract language code for other
             languages (e.g. "fra" for French, "deu" for German).
 
-    Returns a JSON object containing:
-        filename, lang, char_count, text (the OCR-extracted string).
+    Returns Markdown: an "# Attachment OCR Text" heading, bullets for
+    filename, lang, and char_count, then a "## Text" section whose fenced
+    code block holds the OCR-extracted text.
     """
     suffix = Path(filename).suffix.lower()
-    if suffix not in _IMAGE_EXTENSIONS:
-        raise ValueError(
-            f"'{filename}' has an unsupported extension ('{suffix}'). "
-            f"Supported image extensions: {', '.join(sorted(_IMAGE_EXTENSIONS))}."
-        )
 
     _, namespace = _get_outlook()
     item = namespace.GetItemFromID(entry_id)
@@ -821,28 +1244,37 @@ def read_attachment_image_ocr(
     if target_att is None:
         raise ValueError(f"Attachment '{filename}' not found on email '{entry_id}'.")
 
+    is_image = suffix in _IMAGE_EXTENSIONS or (
+        not suffix and _mapi_string(target_att, _PR_ATTACH_MIME_TAG).lower() in _IMAGE_MIME_TYPES
+    )
+    if not is_image:
+        raise ValueError(
+            f"'{filename}' has an unsupported extension ('{suffix}'). "
+            f"Supported image extensions: {', '.join(sorted(_IMAGE_EXTENSIONS))}."
+        )
+
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp_path = Path(tmp.name)
 
     try:
         target_att.SaveAsFile(str(tmp_path))
         with Image.open(tmp_path) as img:
-            text = pytesseract.image_to_string(img, lang=lang)
+            text = _lf(pytesseract.image_to_string(img, lang=lang))
     finally:
         try:
             tmp_path.unlink()
         except OSError:
             pass
 
-    return json.dumps({
-        "filename": filename,
-        "lang": lang,
-        "char_count": len(text),
-        "text": text,
-    }, indent=2)
+    return _doc(
+        "# Attachment OCR Text",
+        _kv(filename=_code(filename), lang=lang, char_count=len(text)),
+        "## Text",
+        _fence(text),
+    )
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def get_thread(
     account_name: str,
     conversation_id: str,
@@ -861,19 +1293,15 @@ def get_thread(
         folder_paths: List of slash-separated folder paths to search within
             the account. Defaults to ["Inbox", "Sent Items"].
 
-    Returns a JSON array of full email objects (same fields as get_email)
-    sorted from oldest to newest.
+    Returns Markdown: a "# Thread" heading, bullets for account_name,
+    conversation_id, and message_count, then one "## Message N" section per
+    email, oldest first. Each section has the same bullets and "### Body"
+    block as get_email.
     """
     if folder_paths is None:
         folder_paths = ["Inbox", "Sent Items"]
 
     _, namespace = _get_outlook()
-
-    def _get_body(item):
-        html_body = item.HTMLBody
-        if html_body:
-            return _markdownify(html_body, strip=["img"]).strip(), "markdown"
-        return item.Body or "", "plain"
 
     results = []
     seen_ids = set()
@@ -900,14 +1328,9 @@ def get_thread(
                     continue  # Python-side guard if Restrict was not applied
                 seen_ids.add(item.EntryID)
 
-                recipients = []
-                for r in item.Recipients:
-                    try:
-                        recipients.append(r.Address or r.Name)
-                    except Exception:
-                        recipients.append(r.Name)
+                recipients = [_recipient_address(r) for r in item.Recipients]
 
-                body, body_format = _get_body(item)
+                body, body_format = _item_body(item)
                 entry = _mail_item_summary(item)
                 entry["body"] = body
                 entry["body_format"] = body_format
@@ -920,9 +1343,21 @@ def get_thread(
     # Sort oldest first for chronological reading.
     results.sort(key=lambda e: e["received_time"] or "")
 
-    return json.dumps(results, indent=2)
+    messages = [
+        _email_block(f"Message {n}", entry, 2)
+        for n, entry in enumerate(results, 1)
+    ]
+    return _doc(
+        "# Thread",
+        _kv(
+            account_name=_code(account_name),
+            conversation_id=_code(conversation_id),
+            message_count=len(results),
+        ),
+        *(messages or [_NONE]),
+    )
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def get_folder_counts(account_name: str, folder_path: str = "Inbox") -> str:
     """Get the total and unread item counts for a folder.
 
@@ -934,19 +1369,22 @@ def get_folder_counts(account_name: str, folder_path: str = "Inbox") -> str:
         folder_path: Slash-separated path from the account root.
             Default: "Inbox".
 
-    Returns a JSON object containing:
-        folder_path, total_count, unread_count.
+    Returns Markdown: a "# Folder Counts" heading and bullets for
+    folder_path, total_count, and unread_count.
     """
     _, namespace = _get_outlook()
     folder = _resolve_folder(namespace, account_name, folder_path)
 
-    return json.dumps({
-        "folder_path": folder_path,
-        "total_count": folder.Items.Count,
-        "unread_count": folder.UnReadItemCount,
-    }, indent=2)
+    return _doc(
+        "# Folder Counts",
+        _kv(
+            folder_path=_code(folder_path),
+            total_count=folder.Items.Count,
+            unread_count=folder.UnReadItemCount,
+        ),
+    )
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def create_draft(
     to: list,
     subject: str,
@@ -966,8 +1404,8 @@ def create_draft(
         cc: Optional list of CC recipient addresses or display names.
         bcc: Optional list of BCC recipient addresses or display names.
 
-    Returns a JSON object containing the entry_id of the saved draft and a
-    confirmation message.
+    Returns Markdown: a "# Draft Created" heading and bullets for the
+    entry_id of the saved draft and a confirmation message.
     """
     cc = cc or []
     bcc = bcc or []
@@ -1000,12 +1438,11 @@ def create_draft(
     _, namespace = _get_outlook()
     namespace.SendAndReceive(False)
 
-    return json.dumps({
-        "entry_id": mail.EntryID,
-        "message": "Draft saved and opened in Outlook.",
-    }, indent=2)
+    return _draft_result(
+        "Draft Created", mail.EntryID, "Draft saved and opened in Outlook."
+    )
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def create_reply(
     entry_id: str,
     body: str,
@@ -1028,8 +1465,8 @@ def create_reply(
         reply_all: When True, replies to all recipients (Reply All).
             When False (default), replies only to the sender.
 
-    Returns a JSON object containing the entry_id of the saved draft reply
-    and a confirmation message.
+    Returns Markdown: a "# Reply Draft Created" heading and bullets for the
+    entry_id of the saved draft reply and a confirmation message.
     """
     _, namespace = _get_outlook()
     original = namespace.GetItemFromID(entry_id)
@@ -1048,14 +1485,13 @@ def create_reply(
 
     namespace.SendAndReceive(False)
 
-    return json.dumps({
-        "entry_id": reply.EntryID,
-        "message": (
-            "Reply draft opened in Outlook. Review and click Send when ready."
-        ),
-    }, indent=2)
+    return _draft_result(
+        "Reply Draft Created",
+        reply.EntryID,
+        "Reply draft opened in Outlook. Review and click Send when ready.",
+    )
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def create_forward(
     entry_id: str,
     to: list,
@@ -1080,8 +1516,8 @@ def create_forward(
         cc: Optional list of CC recipient addresses or display names.
         bcc: Optional list of BCC recipient addresses or display names.
 
-    Returns a JSON object containing the entry_id of the saved forward draft
-    and a confirmation message.
+    Returns Markdown: a "# Forward Draft Created" heading and bullets for
+    the entry_id of the saved forward draft and a confirmation message.
     """
     cc = cc or []
     bcc = bcc or []
@@ -1111,12 +1547,11 @@ def create_forward(
 
     namespace.SendAndReceive(False)
 
-    return json.dumps({
-        "entry_id": fwd.EntryID,
-        "message": (
-            "Forward draft opened in Outlook. Review and click Send when ready."
-        ),
-    }, indent=2)
+    return _draft_result(
+        "Forward Draft Created",
+        fwd.EntryID,
+        "Forward draft opened in Outlook. Review and click Send when ready.",
+    )
 
 if __name__ == "__main__":
     mcp.run()
