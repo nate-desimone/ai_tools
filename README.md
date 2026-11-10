@@ -85,7 +85,7 @@ An [MCP](https://modelcontextprotocol.io/) server that gives AI agents read, sea
 - **list_folders** - List folders (optionally recursive) for an account with item counts
 - **get_folder_counts** - Get total and unread item counts for a folder (lightweight, no email iteration)
 - **list_emails** - List emails in a folder, newest first; supports `since`/`until` date range and `unread_only` filter
-- **search_emails** - Search emails by subject, sender, and/or body text within a folder
+- **search_emails** - Search emails by subject, sender, flag state and/or body text within a folder
 - **get_email** - Retrieve the full content of an email by entry ID (body returned as Markdown)
 - **get_thread** - Retrieve all messages in a conversation thread, sorted oldest-first
 

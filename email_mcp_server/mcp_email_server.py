@@ -277,19 +277,24 @@ _EMAIL_COLUMNS = [
 ]
 
 
-def _email_table(summaries: list) -> str:
-    """Render _mail_item_summary dicts as a table with _EMAIL_COLUMNS."""
-    return _table(
-        _EMAIL_COLUMNS,
-        [
-            (
-                s["received_time"], s["sender_name"], _code(s["sender_email"]),
-                s["subject"], s["is_unread"], s["has_attachments"],
-                _code(s["entry_id"]), _code(s["conversation_id"]),
-            )
-            for s in summaries
-        ],
-    )
+def _email_table(summaries: list, with_flags: bool = False) -> str:
+    """Render _mail_item_summary dicts as a table, add flag column when `with_flags==true`."""
+    columns = list(_EMAIL_COLUMNS)
+    if with_flags:
+        columns[4:4] = ["flag_status", "flag_request"]
+    rows = []
+    for s in summaries:
+        cells = [
+            s["received_time"], s["sender_name"], _code(s["sender_email"]), s["subject"],
+        ]
+        if with_flags:
+            cells += [s["flag_status"], s["flag_request"]]
+        cells += [
+            s["is_unread"], s["has_attachments"],
+            _code(s["entry_id"]), _code(s["conversation_id"]),
+        ]
+        rows.append(cells)
+    return _table(columns, rows)
 
 
 def _email_block(heading: str, entry: dict, level: int) -> str:
@@ -784,13 +789,15 @@ def search_emails(
     since: Optional[str] = None,
     until: Optional[str] = None,
     max_results: int = 20,
+    flagged: Optional[bool] = None,
+    include_completed: Optional[bool] = None,
 ) -> str:
     """Search emails by subject, sender, body text, and/or date range within a folder.
 
     You may supply filters using either the 'query' convenience parameter
     (Gmail-style syntax) or the individual named parameters — or both.
     When both are given, the named parameter always overrides the
-    corresponding query token.  At least one filter must be provided.
+    corresponding query token.  At least one filter, or flagged, must be provided.
 
     'query' supports the following Gmail-style operators:
         from:<sender>           — match sender name or email address
@@ -824,23 +831,30 @@ def search_emails(
         until: ISO-8601 date string. Only emails received on or before this
             date are returned. Example: until="2026-04-02".
         max_results: Maximum number of results to return (1-100). Default: 20.
+        flagged: None returns emails regardless of flag state. True returns only
+            flagged emails. False returns only emails that are not flagged.
+            "flagged" is a named parameter, not a query token. Default: None.
+        include_completed: Whether a completed flag counts as flagged. When
+            False, completed flags count as not flagged. Default: None (same as False).
 
     Returns a Markdown list of emails: a "# Search Results" heading, bullets
-    for account_name, folder_path, and count, and a table with one row per
-    match and the columns received_time, sender_name, sender_email, subject,
-    is_unread, has_attachments, entry_id, and conversation_id. Pass entry_id
-    to get_email and conversation_id to get_thread. When nothing matches, the
-    table is replaced by the line "_None._".
+    for account_name, folder_path, flagged, and count, and a table with one row
+    per match and the columns received_time, sender_name, sender_email, subject,
+    is_unread, has_attachments, entry_id, and conversation_id. When flagged is
+    True, the table also has flag_status ("marked" or "complete") and
+    flag_request columns after subject. Pass entry_id to get_email and
+    conversation_id to get_thread. When nothing matches, the table is replaced by
+    the line "_None._".
     """
     if query:
         subject, sender, body, since, until = _parse_query(
             query, subject, sender, body, since, until
         )
 
-    if subject is None and sender is None and body is None and since is None and until is None:
+    if flagged is None and subject is None and sender is None and body is None and since is None and until is None:
         raise ValueError(
-            "At least one filter must be provided via 'query' or the individual "
-            "parameters 'subject', 'sender', 'body', 'since', or 'until'."
+            "At least one filter must be provided via 'query', the individual "
+            "parameters 'subject', 'sender', 'body', 'since', or 'until', or flagged."
         )
 
     max_count = max(1, min(max_results, 100))
@@ -877,12 +891,18 @@ def search_emails(
     sender_lower = sender.lower() if sender else None
     body_lower = body.lower() if body else None
 
+    flag_names = {2: "marked", 1: "complete"}
+    flagged_codes = {2, 1} if include_completed else {2}
+
     results = []
     for item in items:
         if len(results) >= max_count:
             break
         try:
             if item.Class != 43:
+                continue
+            # Restrict("[FlagStatus] = 2") under-matches on some profiles, so check here.
+            if flagged is not None and (item.FlagStatus in flagged_codes) != flagged:
                 continue
             if not restrict_applied and subject_lower:
                 if subject_lower not in (item.Subject or "").lower():
@@ -907,7 +927,11 @@ def search_emails(
             if body_lower:
                 if body_lower not in (item.Body or "").lower():
                     continue
-            results.append(_mail_item_summary(item))
+            summary = _mail_item_summary(item)
+            if flagged:
+                summary["flag_status"] = flag_names[item.FlagStatus]
+                summary["flag_request"] = _inline(item.FlagRequest)
+            results.append(summary)
         except Exception:
             continue
 
@@ -916,9 +940,10 @@ def search_emails(
         _kv(
             account_name=_code(account_name),
             folder_path=_code(folder_path),
+            flagged=flagged,
             count=len(results),
         ),
-        _email_table(results),
+        _email_table(results, with_flags=flagged is True),
     )
 
 
