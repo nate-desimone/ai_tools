@@ -1,6 +1,6 @@
 ---
 name: revising-prose
-description: 'Revise a document for redundancy, conciseness, clarity, and a human voice using Richard Lanham''s "Revising Prose" (the Paramedic Method and the Lard Factor). Use when: asked to edit, tighten, trim, shorten, cut word count, proofread for wordiness, simplify, de-jargon, improve readability or flow, or make AI/LLM-generated text sound human-written. Fixes bureaucratic "Official Style" prose, passive voice, nominalizations, prepositional-phrase strings, "is" verbs, noun stacks, slow windups, redundant phrases, empty hedges, double negatives, and LLM tells (delve, robust, pinned, "lives in", "holds no", "with no", em-dash overuse, "not just X, but Y", trailing ", ensuring..." clauses). Works on Markdown, plain text, emails, self-evaluations, design docs, READMEs, and reports. Edits in place and reports the Lard Factor.'
+description: 'Revise a document for redundancy, conciseness, clarity, and a human voice using Richard Lanham''s "Revising Prose" (the Paramedic Method and the Lard Factor). Use when: asked to edit, tighten, trim, shorten, cut word count, find repeated or redundant sections, proofread for wordiness, simplify, de-jargon, improve readability or flow, or make AI/LLM-generated text sound human-written. Fixes bureaucratic "Official Style" prose, passive voice, nominalizations, prepositional-phrase strings, "is" verbs, noun stacks, slow windups, redundant phrases, points repeated across sections, empty hedges, double negatives, and LLM tells (delve, robust, pinned, "lives in", "holds no", "with no", em-dash overuse, "not just X, but Y", trailing ", ensuring..." clauses). Works on Markdown, plain text, emails, self-evaluations, design docs, READMEs, and reports. Edits in place and reports the Lard Factor.'
 argument-hint: 'File to revise; optionally the audience, a target word count, or "review only"'
 ---
 
@@ -35,10 +35,12 @@ Cut the lard, restore the action, keep every idea. This skill applies Richard A.
 ```
 python <this-skill-dir>/scripts/prose_audit.py scan <file> [--top N]
 python <this-skill-dir>/scripts/prose_audit.py compare <original> <revised>
+python <this-skill-dir>/scripts/prose_audit.py dupes <file> [--top N] [--scope auto|section|block] [--ignore-section REGEX] [--level N]
 ```
 
 - `scan` prints summary metrics and the highest-scoring sentences in Paramedic markup: `[prepositions]`, `{"to be" forms}`, `<nominalizations>`. It also lists prepositional strings, lard phrases with suggested replacements, double-negative candidates, There-is/It-is openers, long sentences, monotone paragraphs, LLM tells, paragraphs with 2+ em dashes, and arrows or emoji.
-- `compare` prints the Lard Factor and a before/after metrics table in Markdown, ready to paste into the report.
+- `compare` prints the Lard Factor and a before/after metrics table in Markdown, ready to paste into the report. The table includes "Sentences repeated elsewhere" and "Words in duplicate sentences", so it shows whether the cuts removed repeats.
+- `dupes` finds repeats across the whole document, which `scan` can't see because it reads one sentence at a time. It lists groups of sentences that make the same point, passages whose wording recurs in other sections (naming those sections), and a per-section echo table. It compares across sections when the document has three or more headings and across paragraphs otherwise; `--scope` overrides that. Words inside inline code count, because identifiers carry the topic in technical writing. Use `--ignore-section` (a regex, repeatable) to skip sections that repeat the body on purpose, such as a changelog.
 - Flags are **candidates, not verdicts**. Judge each one in context; see [Guardrails](#guardrails-when-not-to-cut).
 
 ## Procedure
@@ -54,12 +56,16 @@ python <this-skill-dir>/scripts/prose_audit.py compare <original> <revised>
 
 - Copy the original to the system temp directory, e.g. `%TEMP%\revising-prose\<name>.orig.md` on Windows or `$TMPDIR/revising-prose/` elsewhere. Never put this copy in the workspace. It serves as the LF baseline and as the user's undo.
 - Run `scan` on the original. Note the summary metrics and the worst sentences.
+- For a document longer than a few pages, run `dupes` too and keep its output for step 3.
 
 ### 3. Document pass: cut large redundancies first
 
 Make the big cuts first so you don't polish sentences you will later delete.
 
-- Find points made more than once (intro, body, conclusion, summary bullets). Keep the strongest version and merge any unique details into it.
+- Find points made more than once (intro, body, conclusion, summary bullets). Keep the strongest version and merge any unique details into it. In a long document, start from `dupes`: each group names sentences that make the same point, and each echoed passage names where else its wording appears.
+- For each group, decide which section owns the point. Keep the best wording there, and cut the other copies or reduce them to a pointer ("see section 6.2"). The "up to N words" figure assumes you keep only the longest copy.
+- Apply the clear-cut cuts, such as a sentence that repeats another nearly word for word. Offer the structural ones as options in the report, with the words each would save: a summary table that restates the sections it summarizes, or a threat-model row that restates a mitigation. Removing those changes how the document reads.
+- Leave deliberate repeats alone: summaries and abstracts, changelogs, test plans that restate requirements, coverage tables, glossary entries, and prerequisites repeated in how-to steps. Ask the author when unsure, or re-run `dupes` with `--ignore-section` to hide them.
 - Cut sentences that only restate the heading ("This section describes the build process.").
 - Cut signposts and recaps that repeat content ("As mentioned above", "In summary"). Keep a summary only when a long document needs one for skimmers.
 - Merge duplicate or overlapping bullets.
@@ -126,6 +132,7 @@ Don't swap one LLM word for another ("delve" → "explore", "robust" → "resili
 - **Measure:** Run `compare <temp-copy> <file>`.
   - Low LF on Official Style text (under about 10%) means you should do another pass.
   - High LF (over about 50%) means you should check the meaning again before reporting.
+- **Repeats:** After a redundancy pass, "Sentences repeated elsewhere" and "Words in duplicate sentences" should fall. Re-run `dupes` to confirm that the groups you meant to cut are gone.
 - **Re-scan:** Run `scan` on the revision. Fix every remaining "LLM tells" hit, or keep it on purpose and list it under "Please review" with the reason (for example, "no later than" is a spec limit).
 - **Format:** Make sure the Markdown still renders: headings, lists, tables, links, and code fences are intact. Check for editor errors or lint warnings if available.
 
@@ -142,13 +149,15 @@ Use this template:
 
 ### What changed
 - 3–6 bullets naming the patterns fixed, with counts where useful
-  (e.g., "Turned 14 'the X of' nominalizations into verbs").
+  (e.g., "Turned 14 'the X of' nominalizations into verbs"; "Replaced 6 repeated passages with pointers,
+  cutting repeated sentences from 154 to 142").
 
 ### Before → after
 2–4 of the most instructive sentence rewrites, each with its own LF.
 
 ### Please review
 - Edits where the meaning may have shifted, and open questions for the author, with links to lines.
+- Structural repeats offered as options and not applied, each with the words it would save.
 
 Original saved at: <temp path>
 ```
@@ -160,6 +169,7 @@ Original saved at: <temp path>
 - **Keep established technical nouns** such as "authentication", "memory allocation", and "integration test". They are terms, not lard.
 - **Keep hedges that report real uncertainty** ("likely", "in our tests", "as of March"). Cut only the reflexive ones.
 - **Repeat defined terms.** Don't swap in synonyms to avoid repetition. In technical writing, consistency beats variety.
+- **Keep repeats the genre needs.** Executive summaries, changelogs, per-section prerequisites in a how-to, and test plans that restate requirements are meant to repeat. `dupes` flags them. Cut them only if the author agrees.
 - **Keep terms of art that look like LLM tells:** certificate pinning, pinned memory, pinned dependency versions, GPIO pins, attack surface, trust anchor, clock and power gating, the PI spec's Hand-Off Blocks, and any jargon the document's audience uses every day.
 - **Don't write telegraphese.** Articles, conjunctions, and logical transitions help the reader.
 - **Use understatement ("not bad") only on purpose,** where the genre allows it. That's rare in technical and business writing.
@@ -182,6 +192,7 @@ When the document uses normative keywords (shall, must, required), precision out
 - **Name the responsible component** at least once per requirement.
 - **Repeat the defined term** (db, PK, KEK) instead of "it", "the database", or "nothing".
 - **Make scope explicit:** which boot, which phase, until when.
+- **Keep one authoritative statement per requirement.** When two sections state the same requirement, keep the normative sentence in the section that owns it and point to it from the other. Each removed `shall` or `must` lowers the keyword count that `scan` reports, so mention the removal in the report. Don't pick between statements that disagree; ask the author.
 - **Ask the author about ambiguities you uncover** instead of resolving them yourself.
 
 See [references/llm-tells.md](./references/llm-tells.md) section 7 for over-compressed specification text.

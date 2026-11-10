@@ -3,6 +3,7 @@
 
 scan:    Paramedic Method markup and wordiness metrics for one document.
 compare: Lard Factor and before/after metrics for an original and a revision.
+dupes:   Sentences and passages that repeat other parts of the same document.
 
 Markdown aware: front matter, fenced code, inline code, URLs, images, HTML
 tags, and HTML comments are excluded so word counts reflect prose only.
@@ -11,10 +12,12 @@ tags, and HTML comments are excluded so word counts reflect prose only.
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import statistics
 import sys
 import textwrap
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -332,11 +335,12 @@ SENTENCE_START_CHARS = "\"'([*_"
 QUOTE_TRANSLATION = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'})
 HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
-HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$")
+HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
 HR_RE = re.compile(r"^\s{0,3}([-*_=])(?:\s*\1){2,}\s*$")
 LIST_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?")
 TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?\s*$")
 QUOTE_RE = re.compile(r"^\s*(?:>\s?)+")
+# The first entry removes inline code; clean_inline(keep_code=True) skips it.
 INLINE_CLEANERS = (
     (re.compile(r"`[^`\n]*`"), ""),
     (re.compile(r"!\[[^\]\n]*\]\([^)\n]*\)"), ""),
@@ -358,6 +362,7 @@ class Segment:
     line: int
     text: str
     kind: str  # "prose", "heading", or "cell"
+    level: int = 0  # heading depth; 0 for other kinds
 
 
 @dataclass
@@ -404,6 +409,8 @@ class Report:
     path: Path
     sentences: list[Sentence]
     blocks: list[list[Sentence]]
+    raw: str = ""
+    overlap: Overlap | None = None
 
 
 def is_nominalization(word: str) -> bool:
@@ -522,7 +529,7 @@ def extract_segments(raw: str) -> list[Segment]:
         m = HEADING_RE.match(line)
         if m:
             flush()
-            segments.append(Segment(lineno, m.group(1), "heading"))
+            segments.append(Segment(lineno, m.group(2), "heading", len(m.group(1))))
             continue
         if line.lstrip().startswith("|"):
             flush()
@@ -540,18 +547,18 @@ def extract_segments(raw: str) -> list[Segment]:
     return segments
 
 
-def clean_inline(text: str) -> str:
-    for regex, repl in INLINE_CLEANERS:
+def clean_inline(text: str, keep_code: bool = False) -> str:
+    for regex, repl in INLINE_CLEANERS[1 if keep_code else 0:]:
         text = regex.sub(repl, text)
     return text
 
 
-def split_sentences(text: str) -> list[tuple[int, str]]:
+def split_sentences(text: str, start_chars: str = SENTENCE_START_CHARS) -> list[tuple[int, str]]:
     sentences = []
     start = 0
     for m in BOUNDARY_RE.finditer(text):
         nxt = text[m.end():m.end() + 1]
-        if nxt and not (nxt.isupper() or nxt.isdigit() or nxt in SENTENCE_START_CHARS):
+        if nxt and not (nxt.isupper() or nxt.isdigit() or nxt in start_chars):
             continue
         prev = re.search(r"(\S+)$", text[start:m.start() + 1])
         if prev:
@@ -584,7 +591,7 @@ def analyze_document(path: Path) -> Report:
         sentences.extend(block)
         if block:
             blocks.append(block)
-    return Report(path, sentences, blocks)
+    return Report(path, sentences, blocks, raw)
 
 
 def word_count(rep: Report) -> int:
@@ -604,8 +611,283 @@ def dash_heavy_blocks(rep: Report) -> list[list[Sentence]]:
     return [b for b in rep.blocks if sum(s.dashes for s in b) >= 2]
 
 
+# Function words, negations, and modals carry no topic: "shall release X" should match "must not release X".
+DUP_STOPWORDS = PREPOSITIONS | frozenset(
+    """
+    a an the and or is are was were be been being am that this these those it its so such which
+    who whom whose each every any all also can may must shall should will would could has have
+    had do does did if only when while where whether their there they them we you he she his her
+    him me my our us your not no one other another same more most because since although though
+    however therefore thus hence but yet too very then than once now still just on as out up down
+    off like
+    """.split()
+)
+DUP_WORD_RE = re.compile(r"[^\W\d]\w*|\d+")
+DUP_XREF_RE = re.compile(
+    r"\((?:see\b[^)]*|(?:sections?|items?|steps?|figures?|tables?|chapters?)\s+[A-Z]?\d[^)]*)\)"
+    r"|\b(?:sections?|items?|steps?|figures?|tables?|chapters?)\s+[A-Z]?\d[\d.]*"
+    r"(?:\s*(?:,|and|to|through)\s*[A-Z]?\d[\d.]*)*",
+    re.I,
+)
+INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+BULLET_RE = re.compile("^[\u2022\u25cf\u25aa\u2023\u2043\\s]+")
+
+DUP_MIN_UNIT_TOKENS = 6  # shorter sentences match by chance
+DUP_UNIT_COSINE = 0.62
+DUP_UNIT_CONTAINMENT = 0.7  # weighted share of the shorter sentence's words found in the other
+DUP_MIN_BLOCK_TOKENS = 18
+DUP_MIN_BLOCK_PAIRS = 12  # distinctive word pairs a passage needs before its echo is scored
+DUP_ECHO_SHARE = 0.4
+DUP_MIN_SECTIONS = 3  # fewer headings than this: compare paragraphs, not sections
+
+
+@dataclass
+class Section:
+    line: int
+    level: int
+    title: str
+    parent: int
+    ignored: bool = False
+
+
+@dataclass(eq=False)
+class Item:
+    """A sentence or a passage (paragraph, list item, table cell) prepared for comparison."""
+
+    idx: int
+    line: int
+    text: str
+    block: int
+    section: int
+    tokens: list[str]
+    words: int
+    uni: frozenset = field(init=False)
+    bi: frozenset = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.uni = frozenset(self.tokens)
+        self.bi = frozenset(zip(self.tokens, self.tokens[1:]))
+
+
+@dataclass
+class Group:
+    members: list[Item]
+    best: float
+    saving: int
+
+
+@dataclass
+class Echo:
+    item: Item
+    share: float
+    partners: list[tuple[Item, int]]
+
+
+@dataclass
+class Overlap:
+    sections: list[Section]
+    scope: str
+    level: int
+    units: list[Item]
+    blocks: list[Item]
+    groups: list[Group]
+    echoes: list[Echo]
+
+    @property
+    def repeated_sentences(self) -> int:
+        return sum(len(g.members) - 1 for g in self.groups)
+
+    @property
+    def repeated_words(self) -> int:
+        return sum(g.saving for g in self.groups)
+
+
+def dup_stem(word: str) -> str:
+    if len(word) < 4:
+        return word
+    if word.endswith("ies") and len(word) > 4:
+        word = word[:-3] + "y"
+    elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
+        word = word[:-1]
+    if word.endswith("ing") and len(word) > 5:
+        word = word[:-3]
+    elif word.endswith("ed") and len(word) > 4:
+        word = word[:-2]
+    if word.endswith("e") and len(word) > 3:
+        word = word[:-1]
+    return word
+
+
+def dup_tokens(text: str) -> list[str]:
+    text = DUP_XREF_RE.sub(" ", text.replace("`", " ")).lower()
+    return [
+        dup_stem(w) for w in DUP_WORD_RE.findall(text) if w not in DUP_STOPWORDS and (len(w) > 1 or w.isdigit())
+    ]
+
+
+def shorten(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
+
+
+def find_similar(items: list[Item], key) -> list[tuple[float, Item, Item]]:
+    """Pairs of items in different scopes whose wording largely coincides (TF-IDF cosine or phrase overlap)."""
+    n = len(items)
+    if n < 2:
+        return []
+    df: Counter = Counter()
+    for it in items:
+        df.update(it.uni)
+    idf = {w: math.log((n + 1) / (c + 1)) + 1.0 for w, c in df.items()}
+    norm = [math.sqrt(sum(idf[w] ** 2 for w in it.uni)) for it in items]
+    max_df = min(100, max(30, n // 16))
+    postings: dict[str, list[int]] = defaultdict(list)
+    for i, it in enumerate(items):
+        for w in it.uni:
+            if df[w] <= max_df:
+                postings[w].append(i)
+    pairs = []
+    for i, a in enumerate(items):
+        rare: dict[int, float] = defaultdict(float)
+        for w in a.uni:
+            if df[w] <= max_df:
+                for j in postings[w]:
+                    if j > i:
+                        rare[j] += idf[w] ** 2
+        for j, weight in rare.items():
+            b = items[j]
+            # Skip pairs that share too little uncommon vocabulary to be worth scoring.
+            if key(a) == key(b) or weight < 0.2 * norm[i] * norm[j]:
+                continue
+            shared = sum(idf[w] ** 2 for w in a.uni & b.uni)
+            cosine = shared / (norm[i] * norm[j])
+            contained = shared / min(norm[i], norm[j]) ** 2
+            common = len(a.bi & b.bi)
+            if (cosine >= DUP_UNIT_COSINE and common >= 2) or (contained >= DUP_UNIT_CONTAINMENT and common >= 3):
+                pairs.append((max(cosine, contained), a, b))
+    return pairs
+
+
+def group_pairs(pairs: list[tuple[float, Item, Item]]) -> list[Group]:
+    """Group sentences around the one most others resemble, so every member matches the center."""
+    near: dict[int, dict[int, float]] = defaultdict(dict)
+    items: dict[int, Item] = {}
+    for sim, a, b in pairs:
+        near[a.idx][b.idx] = near[b.idx][a.idx] = sim
+        items[a.idx], items[b.idx] = a, b
+    free = set(near)
+    groups = []
+    while free:
+        center = max(
+            free,
+            key=lambda i: (
+                sum(1 for j in near[i] if j in free),
+                sum(s for j, s in near[i].items() if j in free),
+                -i,
+            ),
+        )
+        linked = [j for j in near[center] if j in free]
+        if not linked:
+            break
+        free.difference_update(linked)
+        free.discard(center)
+        found = sorted((items[i] for i in [center] + linked), key=lambda it: (it.line, it.idx))
+        saving = sum(it.words for it in found) - max(it.words for it in found)
+        groups.append(Group(found, max(near[center][j] for j in linked), saving))
+    groups.sort(key=lambda g: (-g.saving, -g.best, g.members[0].line))
+    return groups
+
+
+def echo_scores(blocks: list[Item], key) -> list[Echo]:
+    """For each passage, the share of its distinctive word pairs that also occur in other scopes."""
+    where: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for i, b in enumerate(blocks):
+        for pair in b.bi:
+            where[pair].append(i)
+    max_df = max(4, min(14, len(blocks) // 90))
+    echoes = []
+    for i, b in enumerate(blocks):
+        if len(b.tokens) < DUP_MIN_BLOCK_TOKENS:
+            continue
+        distinctive = [p for p in b.bi if len(where[p]) <= max_df]
+        if len(distinctive) < DUP_MIN_BLOCK_PAIRS:
+            continue
+        shared = 0
+        partners: Counter = Counter()
+        for pair in distinctive:
+            others = [j for j in where[pair] if j != i and key(blocks[j]) != key(b)]
+            if others:
+                shared += 1
+                partners.update(others)
+        echoes.append(Echo(b, shared / len(distinctive), [(blocks[j], c) for j, c in partners.most_common(3)]))
+    return echoes
+
+
+def plain(text: str) -> str:
+    return BULLET_RE.sub("", " ".join(text.replace("`", "").split()))
+
+
+def build_overlap(raw: str, scope: str = "auto", ignore: tuple = (), level: int = 3) -> Overlap:
+    ignore_res = [re.compile(p, re.I) for p in ignore]
+    sections = [Section(1, 0, "", -1)]
+    stack = [(0, 0)]  # (heading level, section index) of the open headings
+    current = 0
+    units: list[Item] = []
+    blocks: list[Item] = []
+    for seg in extract_segments(raw):
+        if seg.kind == "heading":
+            while stack[-1][0] >= seg.level:
+                stack.pop()
+            title = plain(clean_inline(seg.text, keep_code=True))
+            parent = stack[-1][1]
+            ignored = sections[parent].ignored or any(r.search(title) for r in ignore_res)
+            sections.append(Section(seg.line, seg.level, title, parent, ignored))
+            current = len(sections) - 1
+            stack.append((seg.level, current))
+            continue
+        if sections[current].ignored:
+            continue
+        texts, words, clauses = [], 0, []
+        for part in re.split(r"<br\s*/?>", seg.text, flags=re.I):
+            text = clean_inline(part, keep_code=True)
+            texts.append(text)
+            words += len(WORD_RE.findall(INLINE_CODE_RE.sub("", text)))
+            for offset, sentence in split_sentences(text, SENTENCE_START_CHARS + "`"):
+                line = seg.line + text.count("\n", 0, offset)
+                clauses.extend((line, c) for c in re.split(r";\s+", " ".join(sentence.split())))
+        flat = plain(" ".join(texts))
+        tokens = dup_tokens(flat)
+        if not tokens:
+            continue
+        block_id = len(blocks)
+        blocks.append(Item(block_id, seg.line, flat, block_id, current, tokens, words))
+        for line, clause in clauses:
+            clause_tokens = dup_tokens(clause)
+            if len(clause_tokens) >= DUP_MIN_UNIT_TOKENS:
+                clause_words = len(WORD_RE.findall(INLINE_CODE_RE.sub("", clause)))
+                units.append(Item(len(units), line, plain(clause), block_id, current, clause_tokens, clause_words))
+    if scope == "auto":
+        scope = "section" if len({b.section for b in blocks}) >= DUP_MIN_SECTIONS else "block"
+    key = (lambda it: it.section) if scope == "section" else (lambda it: it.block)
+    groups = group_pairs(find_similar(units, key))
+    return Overlap(sections, scope, level, units, blocks, groups, echo_scores(blocks, key))
+
+
+def overlap_of(rep: Report) -> Overlap:
+    if rep.overlap is None:
+        rep.overlap = build_overlap(rep.raw)
+    return rep.overlap
+
+
+def rollup(sections: list[Section], idx: int, level: int) -> int:
+    while sections[idx].level > level and sections[idx].parent > 0:
+        idx = sections[idx].parent
+    return idx
+
+
 def summarize(rep: Report) -> list[tuple[str, float, str]]:
     words = word_count(rep)
+    overlap = overlap_of(rep)
     lengths = [len(s.words) for s in rep.sentences if s.kind == "prose"]
 
     def total(fn) -> int:
@@ -632,6 +914,8 @@ def summarize(rep: Report) -> list[tuple[str, float, str]]:
         ("Negatives", total(lambda s: s.negatives), "{:.0f}"),
         ("Double-negative candidates", total(lambda s: len(s.double_neg)), "{:.0f}"),
         ("Monotone paragraphs", len(monotone_blocks(rep)), "{:.0f}"),
+        ("Sentences repeated elsewhere", overlap.repeated_sentences, "{:.0f}"),
+        ("Words in duplicate sentences", overlap.repeated_words, "{:,.0f}"),
         ("LLM tells", total(lambda s: len(s.llm)), "{:.0f}"),
         ("Em dashes", total(lambda s: s.dashes), "{:.0f}"),
         ("Paragraphs with 2+ em dashes", len(dash_heavy_blocks(rep)), "{:.0f}"),
@@ -660,7 +944,9 @@ def wrap(text: str, indent: str = "    ") -> str:
 
 
 # PowerShell often decodes piped UTF-8 with the OEM code page, so keep common punctuation ASCII.
-ASCII_OUT = str.maketrans({"\u2014": "--", "\u2013": "-", "\u2026": "...", "\u2192": "->", "\u2190": "<-", "\u00a0": " "})
+ASCII_OUT = str.maketrans(
+    {"\u2014": "--", "\u2013": "-", "\u2026": "...", "\u2192": "->", "\u2190": "<-", "\u2022": "*", "\u00a0": " "}
+)
 
 
 def emit(text: str = "") -> None:
@@ -679,6 +965,8 @@ def cmd_scan(args: argparse.Namespace) -> None:
     emit("(Excludes front matter, code, inline code, URLs, and HTML.)")
     for label, value, fmt in summarize(rep):
         emit(f"  {label:<32} {fmt.format(value)}")
+    if overlap_of(rep).groups:
+        emit("  (Repeated content found: the dupes command lists it.)")
 
     emit("\nMarkup legend: [preposition]  {to-be form}  <nominalization>  ('to' includes infinitives)")
     worst = sorted((s for s in rep.sentences if s.score > 0), key=lambda s: s.score, reverse=True)[: args.top]
@@ -740,6 +1028,68 @@ def cmd_scan(args: argparse.Namespace) -> None:
     )
 
 
+def location(ov: Overlap, item: Item) -> str:
+    if len(ov.sections) == 1:
+        return f"L{item.line}"
+    return f"L{item.line} [{shorten(ov.sections[item.section].title or 'top of document', 48)}]"
+
+
+def list_title(label: str, shown: int, total: int, noun: str) -> str:
+    return f"{label} ({total} {noun})" if total <= shown else f"{label} (top {shown} of {total} {noun})"
+
+
+def cmd_dupes(args: argparse.Namespace) -> None:
+    raw = Path(args.file).read_text(encoding="utf-8-sig", errors="replace")
+    ov = build_overlap(raw, args.scope, args.ignore_section, args.level)
+    passages = sum(b.words for b in ov.blocks)
+    cut = ov.repeated_words
+    by_section = ov.scope == "section"
+    emit(f"== Repeated content: {args.file} ==")
+    emit("(Excludes front matter, code blocks, URLs, and HTML. Inline code counts as words.)")
+    emit(f"  {'Compared across':<36} {'sections' if by_section else 'paragraphs, list items, table cells'}")
+    emit(f"  {'Sentences compared':<36} {len(ov.units):,}")
+    emit(f"  {'Passages compared':<36} {len(ov.blocks):,}")
+    emit(f"  {'Sentences repeated elsewhere':<36} {ov.repeated_sentences:,} in {len(ov.groups):,} groups")
+    emit(f"  {'Words in duplicate sentences':<36} {cut:,} of {passages:,} ({100.0 * cut / max(passages, 1):.0f}%)")
+
+    rows = []
+    for n, g in enumerate(ov.groups[: args.top], 1):
+        rows.append(f"\n{n}. {len(g.members)} sentences make the same point (match {g.best:.0%}); "
+                    f"up to {g.saving} words could go")
+        for m in g.members[:4]:
+            rows.append(f"    {location(ov, m)}")
+            rows.append(wrap(shorten(m.text, 300), "        "))
+        if len(g.members) > 4:
+            rows.append(f"    ... and {len(g.members) - 4} more")
+    section(list_title("Repeated sentences", args.top, len(ov.groups), "groups"), rows)
+
+    echoed = sorted((e for e in ov.echoes if e.share >= DUP_ECHO_SHARE), key=lambda e: -e.share * e.item.words)
+    rows = []
+    for n, e in enumerate(echoed[: args.top], 1):
+        rows.append(f"\n{n}. {location(ov, e.item)}: {e.item.words} words, "
+                    f"{e.share:.0%} of its wording recurs elsewhere")
+        rows.append(wrap(shorten(e.item.text, 300), "    "))
+        for other, count in e.partners:
+            rows.append(f"    also in {location(ov, other)} ({count} shared phrases)")
+    section(list_title("Echoed passages", args.top, len(echoed), "passages"), rows)
+
+    if len(ov.sections) > 1:
+        words: Counter = Counter()
+        gone: Counter = Counter()
+        for b in ov.blocks:
+            words[rollup(ov.sections, b.section, ov.level)] += b.words
+        for e in echoed:
+            gone[rollup(ov.sections, e.item.section, ov.level)] += e.item.words
+        rows = [f"  {'Section':<44} {'Words':>7} {'Echoed':>7} {'Share':>6}"] if gone else []
+        for idx, count in gone.most_common(args.top):
+            title = shorten(ov.sections[idx].title or "top of document", 44)
+            rows.append(f"  {title:<44} {words[idx]:>7,} {count:>7,} {count / words[idx]:>6.0%}")
+        section(f"Echo by section (headings down to level {ov.level})", rows)
+
+    emit("\nGroups and echoed passages are candidates. Keep the strongest version; point to it from the rest.")
+    emit("Leave deliberate repeats (summaries, changelogs, test plans) alone or skip them: --ignore-section.")
+
+
 def cmd_compare(args: argparse.Namespace) -> None:
     before = analyze_document(Path(args.original))
     after = analyze_document(Path(args.revised))
@@ -766,7 +1116,32 @@ def main() -> int:
     compare.add_argument("original")
     compare.add_argument("revised")
     compare.set_defaults(func=cmd_compare)
+    dupes = sub.add_parser("dupes", help="Sentences and passages that repeat other parts of the document")
+    dupes.add_argument("file")
+    dupes.add_argument("--top", type=int, default=10, help="entries to show in each list (default 10)")
+    dupes.add_argument(
+        "--scope",
+        choices=("auto", "section", "block"),
+        default="auto",
+        help="where a repeat must be found: another section, or another paragraph, list item, or table cell "
+        "(default auto: section when the document has 3 or more sections)",
+    )
+    dupes.add_argument(
+        "--ignore-section",
+        action="append",
+        default=[],
+        metavar="REGEX",
+        help="skip sections whose heading matches REGEX, subsections included; repeatable "
+        "(for text that repeats the body on purpose, such as a changelog or test plan)",
+    )
+    dupes.add_argument("--level", type=int, default=3, help="deepest heading level for the section table (default 3)")
+    dupes.set_defaults(func=cmd_dupes)
     args = parser.parse_args()
+    for pattern in getattr(args, "ignore_section", []):
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            parser.error(f"bad --ignore-section pattern {pattern!r}: {exc}")
     for name in ("file", "original", "revised"):
         path = getattr(args, name, None)
         if path and not Path(path).is_file():
