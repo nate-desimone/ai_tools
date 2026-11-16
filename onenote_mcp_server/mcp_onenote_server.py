@@ -22,6 +22,7 @@ import html as _html_lib
 import json
 import re
 import time
+from typing import Any, Callable
 from xml.etree import ElementTree as ET
 
 import comtypes.client
@@ -39,6 +40,9 @@ mcp = FastMCP("OneNote")
 
 # XML namespace used by OneNote 2016/2019
 _NS = "http://schemas.microsoft.com/office/onenote/2013/onenote"
+
+# XMLSchema enum: pass explicitly, since newer OneNote builds default to xs2026
+_XS_2013 = 2
 
 # HierarchyScope enum (values verified from the OneNote 2016 type library)
 _HS_SELF = 0           # The node itself only
@@ -73,6 +77,18 @@ _COM_RETRY_DELAY = 0.1  # seconds
 _onenote_mod = None
 
 
+def _onenote_hresult_name(hresult: int) -> str:
+    """Return the type library's hr* name for a OneNote HRESULT, or ""."""
+    if _onenote_mod is None:
+        return ""
+    code = hresult & 0xFFFFFFFF
+    for name in dir(_onenote_mod):
+        value = getattr(_onenote_mod, name, None)
+        if name.startswith("hr") and isinstance(value, int) and (value & 0xFFFFFFFF) == code:
+            return name
+    return ""
+
+
 class _ComRetryProxy:
     """Transparent proxy around a comtypes COM object.
 
@@ -101,6 +117,11 @@ class _ComRetryProxy:
                     ) and attempt < _COM_MAX_RETRIES - 1:
                         time.sleep(_COM_RETRY_DELAY)
                         continue
+                    name = _onenote_hresult_name(exc.hresult)
+                    if name:
+                        raise RuntimeError(
+                            f"OneNote error {name} (0x{exc.hresult & 0xFFFFFFFF:08X})"
+                        ) from exc
                     raise
 
         return _retrying
@@ -110,7 +131,7 @@ class _ComRetryProxy:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _get_onenote():
+def _get_onenote() -> Any:
     """Return the OneNote IApplication COM object via comtypes.
 
     comtypes generates vtable bindings from the OneNote type library, which
@@ -140,7 +161,13 @@ def _parse_xml(xml_str: str) -> ET.Element:
     if xml_str and xml_str[0] == "\ufeff":
         xml_str = xml_str[1:]
     ET.register_namespace("one", _NS)
-    return ET.fromstring(xml_str)
+    root = ET.fromstring(xml_str)
+    if not root.tag.startswith(f"{{{_NS}}}"):
+        raise RuntimeError(
+            f"OneNote returned XML in an unexpected schema (root {root.tag}); "
+            f"this server only parses {_NS}"
+        )
+    return root
 
 
 def _sections_recursive(element: ET.Element, parent_id: str) -> list:
@@ -182,14 +209,15 @@ def _sections_recursive(element: ET.Element, parent_id: str) -> list:
     return results
 
 
-def _extract_search_results(root: ET.Element, max_results: int) -> list:
-    """Recursively walk FindPages result XML and return a flat list of page dicts."""
+def _extract_search_results(root: ET.Element) -> list:
+    """Walk FindPages or GetHierarchy(HS_PAGES) XML and return a flat list of page dicts.
+
+    Pages inside a notebook's recycle bin are skipped.
+    """
     results = []
 
     def _walk(element, notebook_id="", notebook_name="",
               section_id="", section_name=""):
-        if len(results) >= max_results:
-            return
         local = element.tag.split("}")[-1] if "}" in element.tag else element.tag
         if local == "Notebooks":
             for child in element:
@@ -200,6 +228,8 @@ def _extract_search_results(root: ET.Element, max_results: int) -> list:
             for child in element:
                 _walk(child, nb_id, nb_name, section_id, section_name)
         elif local == "SectionGroup":
+            if element.get("isRecycleBin") == "true":
+                return
             for child in element:
                 _walk(child, notebook_id, notebook_name, section_id, section_name)
         elif local == "Section":
@@ -221,6 +251,115 @@ def _extract_search_results(root: ET.Element, max_results: int) -> list:
 
     _walk(root)
     return results
+
+
+def _iter_sections(element: ET.Element, notebook_name: str = ""):
+    """Yield (notebook_name, section element) for every section under *element*."""
+    for child in element:
+        local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if local == "Notebook":
+            yield from _iter_sections(child, child.get("name", ""))
+        elif local == "SectionGroup" and child.get("isRecycleBin") != "true":
+            yield from _iter_sections(child, notebook_name)
+        elif local == "Section":
+            yield notebook_name, child
+
+
+def _match_by_name(candidates: list, name: str, kind: str) -> ET.Element:
+    """Pick the one (label, element) whose name equals, else contains, *name* (case-insensitive)."""
+    want = name.strip().lower()
+    exact = [c for c in candidates if c[1].get("name", "").lower() == want]
+    hits = exact or [c for c in candidates if want in c[1].get("name", "").lower()]
+    if len(hits) == 1:
+        return hits[0][1]
+    if not hits:
+        raise ValueError(f"No {kind} matches '{name}'")
+    labels = "; ".join(label for label, _ in hits[:10])
+    raise ValueError(f"'{name}' matches {len(hits)} {kind}s; use a more specific name: {labels}")
+
+
+def _resolve_scope(onenote, notebook_id: str, notebook: str, section: str) -> tuple:
+    """Return (start node ID, description) for a search scope given by ID or by name."""
+    if notebook_id and notebook:
+        raise ValueError("pass either notebook_id or notebook, not both")
+    start = notebook_id
+    parts = []
+    if notebook:
+        root = _parse_xml(onenote.GetHierarchy("", _HS_CHILDREN, xsSchema=_XS_2013))
+        books = [(nb.get("name", ""), nb) for nb in root.findall(_tag("Notebook"))]
+        nb = _match_by_name(books, notebook, "notebook")
+        start = nb.get("ID", "")
+        parts.append(nb.get("name", ""))
+    if section:
+        root = _parse_xml(onenote.GetHierarchy(start, _HS_SECTIONS, xsSchema=_XS_2013))
+        sections = [
+            (f"{nb_name} / {sec.get('name', '')}", sec)
+            for nb_name, sec in _iter_sections(root, parts[0] if parts else "")
+        ]
+        sec = _match_by_name(sections, section, "section")
+        start = sec.get("ID", "")
+        parts.append(sec.get("name", ""))
+    return start, " / ".join(parts)
+
+
+def _title_rank(title: str, terms: str) -> int:
+    """Rank a page title for a search: 0 exact, 1 starts with, 2 has every term, 3 no title match."""
+    t = title.lower()
+    if t == terms:
+        return 0
+    if t.startswith(terms):
+        return 1
+    if all(word in t for word in terms.split()):
+        return 2
+    return 3
+
+
+def _fill_notebooks(onenote, results: list) -> None:
+    """Fill in notebook_id and notebook_name where the search started below the notebook."""
+    if all(r["notebook_id"] for r in results):
+        return
+    root = _parse_xml(onenote.GetHierarchy("", _HS_SECTIONS, xsSchema=_XS_2013))
+    owner = {}
+    for nb in root.findall(_tag("Notebook")):
+        for _, sec in _iter_sections(nb, nb.get("name", "")):
+            owner[sec.get("ID", "")] = (nb.get("ID", ""), nb.get("name", ""))
+    for r in results:
+        if not r["notebook_id"]:
+            r["notebook_id"], r["notebook_name"] = owner.get(r["section_id"], ("", ""))
+
+
+def _check_format(fmt: str) -> None:
+    if fmt not in ("markdown", "json"):
+        raise ValueError(f"format must be 'markdown' or 'json', got {fmt!r}")
+
+
+def _md_report(title: str, fields: dict, rows: list, columns: list,
+               code_columns: tuple = ()) -> str:
+    """Render a heading, one bullet per field, and a Markdown table of *rows*.
+
+    Columns named *_time are cut to minute precision, and code_columns are wrapped
+    in backticks so that IDs can be copied exactly.
+    """
+    lines = [f"# {title}", ""]
+    for key, value in fields.items():
+        lines.append(f"- **{key}:** {str(value).lower() if isinstance(value, bool) else value}")
+    lines.append("")
+    if not rows:
+        lines.append("_None._")
+        return "\n".join(lines)
+    lines.append("| " + " | ".join(columns) + " |")
+    lines.append("|" + "---|" * len(columns))
+    for row in rows:
+        cells = []
+        for col in columns:
+            value = row.get(col, "")
+            text = str(value).lower() if isinstance(value, bool) else str(value)
+            text = text.replace("\r", " ").replace("\n", " ").replace("|", "\\|").strip()
+            if col.endswith("_time") and text:
+                text = text[:16] + "Z"
+            cells.append(f"`{text}`" if col in code_columns and text else text)
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -588,8 +727,6 @@ def _markdown_to_oes(md_text: str) -> list:
     broken XML fragments.  After splitting on the remaining top-level tags,
     the stashed blocks are expanded in-place.
     """
-    html = _markdown.markdown(md_text.strip(), extensions=_MD_EXTENSIONS)
-
     # Normalize 2-space-indented list items to 4-space so that the markdown
     # library correctly nests them.  Agents often emit 2-space indentation;
     # Python's markdown library requires 4 spaces per indent level.
@@ -637,7 +774,7 @@ def _markdown_to_oes(md_text: str) -> list:
     # --- Phase 1: stash all container elements ---
     stash: dict = {}
 
-    def _stash(tag: str) -> "Callable[[re.Match], str]":
+    def _stash(tag: str) -> Callable[[re.Match], str]:
         def _replace(m: re.Match) -> str:
             token = f"\x00{tag.upper()}{len(stash)}\x00"
             stash[token] = (tag, m.group(0))
@@ -722,8 +859,6 @@ def _markdown_to_oes(md_text: str) -> list:
                             break
                         # Serialize inline element back to HTML
                         text_parts.append(ET.tostring(child, encoding="unicode"))
-                        if child.tail:
-                            text_parts.append(child.tail)
                     item_text = "".join(text_parts)
                     item_text = re.sub(r"</?p[^>]*>", "", item_text).strip()
                     item_text = re.sub(r"\n+", " ", item_text).strip()
@@ -1015,19 +1150,25 @@ def _build_replace_xml(existing_xml: str, oes: list) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_notebooks() -> str:
+def list_notebooks(format: str = "markdown") -> str:
     """List all OneNote notebooks currently open in the local OneNote application.
 
-    Returns a JSON array of notebook objects, each containing:
+    Args:
+        format: "markdown" (default) returns a table of id, name,
+            last_modified_time and is_unread. "json" returns an array of objects
+            that also have path and color.
+
+    Fields:
       - id: the unique OneNote object ID (use this in other tool calls)
       - name: display name
-      - path: local or UNC path to the notebook folder
+      - path: local or UNC path to the notebook folder (json only)
       - last_modified_time: ISO 8601 timestamp
-      - color: notebook color code (may be empty)
+      - color: notebook color code, may be empty (json only)
       - is_unread: whether the notebook has unread content
     """
+    _check_format(format)
     onenote = _get_onenote()
-    xml = onenote.GetHierarchy("", _HS_CHILDREN)
+    xml = onenote.GetHierarchy("", _HS_CHILDREN, xsSchema=_XS_2013)
     root = _parse_xml(xml)
 
     notebooks = []
@@ -1043,56 +1184,75 @@ def list_notebooks() -> str:
 
     if not notebooks:
         return "No open notebooks found in OneNote."
-    return json.dumps(notebooks, indent=2)
+    if format == "json":
+        return json.dumps(notebooks, indent=2)
+    return _md_report("Notebooks", {"count": len(notebooks)}, notebooks,
+                      ["id", "name", "last_modified_time", "is_unread"],
+                      code_columns=("id",))
 
 
 @mcp.tool()
-def list_sections(notebook_id: str) -> str:
+def list_sections(notebook_id: str, format: str = "markdown") -> str:
     """List all sections and section groups in a OneNote notebook.
 
     Args:
         notebook_id: The ID of the notebook, obtained from list_notebooks.
+        format: "markdown" (default) returns a table of id, name, type, group,
+            last_modified_time, is_unread and is_locked, where group is the name
+            of the section group that holds the row. "json" returns an array of
+            objects that have parent_id and color instead of group.
 
-    Returns a JSON array of section objects, each containing:
+    Fields:
       - id: unique OneNote object ID (use this in other tool calls)
       - name: display name
       - type: "Section" or "SectionGroup"
-      - parent_id: ID of the parent notebook or section group
+      - parent_id: ID of the parent notebook or section group (json only)
       - last_modified_time: ISO 8601 timestamp
-      - color: section color code (may be empty)
+      - color: section color code, may be empty (json only)
       - is_unread: whether the section has unread content
       - is_locked: whether the section is password-protected
 
     The list is ordered depth-first so that each section group immediately
     precedes its children.
     """
+    _check_format(format)
     onenote = _get_onenote()
-    xml = onenote.GetHierarchy(notebook_id, _HS_SECTIONS)
+    xml = onenote.GetHierarchy(notebook_id, _HS_SECTIONS, xsSchema=_XS_2013)
     root = _parse_xml(xml)
     sections = _sections_recursive(root, notebook_id)
 
     if not sections:
         return "No sections found in this notebook."
-    return json.dumps(sections, indent=2)
+    if format == "json":
+        return json.dumps(sections, indent=2)
+    groups = {s["id"]: s["name"] for s in sections if s["type"] == "SectionGroup"}
+    rows = [{**s, "group": groups.get(s["parent_id"], "")} for s in sections]
+    return _md_report("Sections", {"count": len(sections)}, rows,
+                      ["id", "name", "type", "group", "last_modified_time",
+                       "is_unread", "is_locked"],
+                      code_columns=("id",))
 
 
 @mcp.tool()
-def list_pages(section_id: str) -> str:
+def list_pages(section_id: str, format: str = "markdown") -> str:
     """List all pages in a OneNote section.
 
     Args:
         section_id: The ID of the section, obtained from list_sections.
+        format: "markdown" (default) returns a table; "json" returns an array of
+            objects with the same fields.
 
-    Returns a JSON array of page objects, each containing:
+    Fields:
       - id: unique OneNote object ID (use this in other tool calls)
       - name: page title
       - date_time: page creation time (ISO 8601)
       - last_modified_time: ISO 8601 timestamp
-      - page_level: indentation level (1 = top-level, 2–3 = sub-page)
+      - page_level: indentation level (1 = top-level, 2-3 = sub-page)
       - is_unread: whether the page has been marked as unread
     """
+    _check_format(format)
     onenote = _get_onenote()
-    xml = onenote.GetHierarchy(section_id, _HS_PAGES)
+    xml = onenote.GetHierarchy(section_id, _HS_PAGES, xsSchema=_XS_2013)
     root = _parse_xml(xml)
 
     pages = []
@@ -1108,7 +1268,12 @@ def list_pages(section_id: str) -> str:
 
     if not pages:
         return "No pages found in this section."
-    return json.dumps(pages, indent=2)
+    if format == "json":
+        return json.dumps(pages, indent=2)
+    return _md_report("Pages", {"count": len(pages)}, pages,
+                      ["id", "name", "page_level", "date_time", "last_modified_time",
+                       "is_unread"],
+                      code_columns=("id",))
 
 
 @mcp.tool()
@@ -1125,7 +1290,7 @@ def get_page_content(page_id: str) -> str:
     page content in Markdown format.
     """
     onenote = _get_onenote()
-    xml = onenote.GetPageContent(page_id, _PI_BASIC)
+    xml = onenote.GetPageContent(page_id, _PI_BASIC, xsSchema=_XS_2013)
     root = _parse_xml(xml)
 
     metadata = {
@@ -1142,42 +1307,89 @@ def get_page_content(page_id: str) -> str:
 
 @mcp.tool()
 def search_notes(
-    query: str,
+    query: str = "",
+    title_contains: str = "",
+    notebook: str = "",
+    section: str = "",
     notebook_id: str = "",
-    max_results: int = 50,
+    sort: str = "relevance",
+    max_results: int = 25,
+    format: str = "markdown",
 ) -> str:
-    """Search for pages matching a query string across OneNote notebooks.
+    """Find OneNote pages by body text, by title, or both.
 
-    Uses the OneNote full-text search index; the same index that powers the
-    in-application search bar.
+    query uses the OneNote full-text index, which matches whole words only, so
+    "WW35" does not match a title like "2026WW35". Wrap query in double quotes
+    for an exact phrase. title_contains is a case-insensitive substring match on
+    page titles and does not use the index, so it also finds "2026WW35".
+    Give at least one of query or title_contains; with both, a page must match both.
 
     Args:
-        query: The text to search for.
-        notebook_id: Optional. When supplied, restricts the search to the
-            specified notebook. Leave blank (default) to search all notebooks.
-        max_results: Maximum number of results to return (1–200, default 50).
+        query: Text to search for in page bodies and titles.
+        title_contains: Substring that the page title must contain.
+        notebook: Notebook name to search in (exact name preferred, else a unique
+            substring). Leave blank to search all notebooks.
+        section: Section name to search in, within notebook if given. Use notebook
+            as well if several notebooks have a section with this name.
+        notebook_id: Alternative to notebook. May be a notebook, section group, or
+            section ID from list_notebooks or list_sections.
+        sort: "relevance" (default) lists pages whose title matches first, then
+            the rest, newest first within each group. "modified" lists newest first.
+        max_results: Maximum number of pages to return (1-200, default 25).
+        format: "markdown" (default) returns a summary and a table of page_id,
+            name, notebook_name, section_name and last_modified_time. "json"
+            returns an object whose results also have section_id, notebook_id
+            and date_time.
 
-    Returns a JSON array of matching page summaries, each containing:
-      - page_id, name, date_time, last_modified_time
-      - section_id, section_name
-      - notebook_id, notebook_name
+    The summary has:
+      - scope: what was searched
+      - total_matches: all matching pages, before max_results is applied
+      - returned, truncated: how many are listed, and whether any were left out
     """
-    if not query.strip():
-        raise ValueError("query must not be empty")
+    query = query.strip()
+    title_contains = title_contains.strip()
+    if not query and not title_contains:
+        raise ValueError("give query or title_contains")
+    if sort not in ("relevance", "modified"):
+        raise ValueError(f"sort must be 'relevance' or 'modified', got {sort!r}")
+    _check_format(format)
     max_results = max(1, min(max_results, 200))
 
     onenote = _get_onenote()
-    # FindPages([in] startNodeID, [in] searchString, [out] xmlOut,
-    #           [in, opt] includeUnindexed, [in, opt] display,
-    #           [in, opt] hsScope)
-    # In win32com dispatch the [out] parameter is returned; omit it here.
-    xml = onenote.FindPages(notebook_id, query)
-    root = _parse_xml(xml)
+    start, scope = _resolve_scope(onenote, notebook_id, notebook, section)
+    if query:
+        xml = onenote.FindPages(start, query, xsSchema=_XS_2013)
+    else:
+        xml = onenote.GetHierarchy(start, _HS_PAGES, xsSchema=_XS_2013)
+    results = _extract_search_results(_parse_xml(xml))
 
-    results = _extract_search_results(root, max_results)
-    if not results:
-        return json.dumps({"message": f"No pages found matching '{query}'.", "results": []}, indent=2)
-    return json.dumps(results, indent=2)
+    if title_contains:
+        needle = title_contains.lower()
+        results = [r for r in results if needle in r["name"].lower()]
+
+    results.sort(key=lambda r: r["last_modified_time"], reverse=True)
+    if sort == "relevance":
+        terms = (title_contains or query).replace('"', "").lower()
+        # Sort is stable, so each title-match group stays newest first.
+        results.sort(key=lambda r: _title_rank(r["name"], terms))
+
+    shown = results[:max_results]
+    _fill_notebooks(onenote, shown)
+    summary = {
+        "scope": scope or (f"notebook_id {notebook_id}" if notebook_id else "all notebooks"),
+        "total_matches": len(results),
+        "returned": len(shown),
+        "truncated": len(results) > len(shown),
+    }
+    if format == "json":
+        return json.dumps({**summary, "results": shown}, indent=2)
+    if summary["truncated"]:
+        summary["note"] = ("Narrow the search with notebook, section or title_contains, "
+                           "or raise max_results (200 at most).")
+    return _md_report("Search Results", summary, shown,
+                      ["page_id", "name", "notebook_name", "section_name",
+                       "last_modified_time"],
+                      code_columns=("page_id",))
 
 
 @mcp.tool()
@@ -1239,11 +1451,8 @@ def create_page(
         "<one:OE><one:T><![CDATA[]]></one:T></one:OE>"
     ]
     page_xml = _build_page_xml(page_id, title, oes)
-    # Pass datetime(1, 1, 1) as the expected-last-modified date to skip
-    # conflict detection (equivalent to the COM automation "zero date").
-    # Pass 0.0 as dateExpectedLastModified (COM DATE float); this skips
-    # conflict detection, which is the correct behaviour for an agent tool.
-    onenote.UpdatePageContent(page_xml, 0.0)
+    # dateExpectedLastModified = 0.0 (COM DATE) skips conflict detection.
+    onenote.UpdatePageContent(page_xml, 0.0, xsSchema=_XS_2013)
 
     return json.dumps({"id": page_id, "title": title}, indent=2)
 
@@ -1281,10 +1490,10 @@ def update_page(
     if mode == "append":
         page_xml = _build_append_xml(page_id, oes)
     else:
-        existing_xml = onenote.GetPageContent(page_id, _PI_BASIC)
+        existing_xml = onenote.GetPageContent(page_id, _PI_BASIC, xsSchema=_XS_2013)
         page_xml = _build_replace_xml(existing_xml, oes)
 
-    onenote.UpdatePageContent(page_xml, 0.0)
+    onenote.UpdatePageContent(page_xml, 0.0, xsSchema=_XS_2013)
     return json.dumps({"page_id": page_id, "mode": mode, "status": "ok"}, indent=2)
 
 

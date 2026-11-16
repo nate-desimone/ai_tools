@@ -168,9 +168,11 @@ An [MCP](https://modelcontextprotocol.io/) server that gives AI agents read, sea
 - **list_sections** - List all sections and section groups in a notebook (recursive, depth-first)
 - **list_pages** - List all pages in a section
 
+The browsing and search tools return a Markdown table by default. Pass `format="json"` to get JSON, which also includes the extra ID and path fields.
+
 **Reading**
 - **get_page_content** - Retrieve the full content of a page as clean Markdown, suitable for direct consumption by AI agents. Handles headings, nested bullet and numbered lists (up to any depth), tables, code blocks, blockquotes, bold/italic inline formatting, and hyperlinks.
-- **search_notes** - Full-text search across all notebooks (or a specific notebook) using the OneNote search index
+- **search_notes** - Find pages by body text (OneNote full-text index), by title substring, or both. Scope the search by notebook or section name, rank pages whose title matches first, and see how many matches were left out (`total_matches`, `truncated`)
 
 **Writing**
 - **create_section** - Create a new section inside a notebook or section group
