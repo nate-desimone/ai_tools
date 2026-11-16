@@ -1149,7 +1149,7 @@ def _build_replace_xml(existing_xml: str, oes: list) -> str:
 # Tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def list_notebooks(format: str = "markdown") -> str:
     """List all OneNote notebooks currently open in the local OneNote application.
 
@@ -1191,7 +1191,7 @@ def list_notebooks(format: str = "markdown") -> str:
                       code_columns=("id",))
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def list_sections(notebook_id: str, format: str = "markdown") -> str:
     """List all sections and section groups in a OneNote notebook.
 
@@ -1233,7 +1233,7 @@ def list_sections(notebook_id: str, format: str = "markdown") -> str:
                       code_columns=("id",))
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def list_pages(section_id: str, format: str = "markdown") -> str:
     """List all pages in a OneNote section.
 
@@ -1276,7 +1276,7 @@ def list_pages(section_id: str, format: str = "markdown") -> str:
                       code_columns=("id",))
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def get_page_content(page_id: str) -> str:
     """Get the full content of a OneNote page as Markdown.
 
@@ -1305,7 +1305,7 @@ def get_page_content(page_id: str) -> str:
     return f"{header}\n\n{body}"
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def search_notes(
     query: str = "",
     title_contains: str = "",
@@ -1392,7 +1392,7 @@ def search_notes(
                       code_columns=("page_id",))
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def create_section(parent_id: str, section_name: str) -> str:
     """Create a new section in a OneNote notebook or section group.
 
@@ -1421,7 +1421,7 @@ def create_section(parent_id: str, section_name: str) -> str:
     return json.dumps({"id": new_section_id, "name": section_name}, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def create_page(
     section_id: str,
     title: str,
@@ -1457,7 +1457,7 @@ def create_page(
     return json.dumps({"id": page_id, "title": title}, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def update_page(
     page_id: str,
     content: str,
